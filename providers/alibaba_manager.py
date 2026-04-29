@@ -190,7 +190,7 @@ class AlibabaManager(CloudProvider):
             return f"Released EIP {rid}"
 
         if rt == ResourceType.SUBNET:   # VSwitch
-            self._call(self._vpc_client.delete_v_switch,
+            self._call(self._vpc_client.delete_vswitch,
                        vpc_models.DeleteVSwitchRequest(v_switch_id=rid))
             return f"Deleted VSwitch {rid}"
 
@@ -251,7 +251,7 @@ class AlibabaManager(CloudProvider):
 
         resources = []
         for sw in alibaba_paginate(
-            lambda r: self._call(self._vpc_client.describe_v_switches, r),
+            lambda r: self._call(self._vpc_client.describe_vswitches, r),
             builder, extractor, total,
         ):
             resources.append(self._make_resource(

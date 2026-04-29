@@ -19,7 +19,7 @@ google-auth>=2.22.0,<3.0
 alibabacloud-ecs20140526>=3.0.0,<4.0
 alibabacloud-vpc20160428>=3.0.0,<4.0
 alibabacloud-tea-openapi>=0.3.0,<1.0
-alibabacloud-credentials>=0.3.0,<1.0
+alibabacloud-credentials>=1.0.0,<2.0
 
 # ── Oracle Cloud ─────────────────────────────────────────────────────────────
 oci>=2.110.0,<3.0

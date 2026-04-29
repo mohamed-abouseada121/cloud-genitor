@@ -479,6 +479,7 @@ class MainWindow(QMainWindow):
                 state_manager=self._state_manager,
             )
             self._delete_worker.log_message.connect(self._log_console.log_message)
+            self._delete_worker.resource_deleted.connect(self._on_resource_deleted)
             self._delete_worker.finished.connect(self._on_delete_finished)
             self._delete_worker.progress.connect(self._progress.setValue)
             self._progress.setVisible(True)

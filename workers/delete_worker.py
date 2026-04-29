@@ -83,6 +83,11 @@ class DeleteWorker(BaseWorker):
 
                 # Announce layer transitions
                 if resource.deletion_layer != current_layer:
+                    if current_layer is not None:
+                        # Wait for cloud to fully process previous layer deletions
+                        import time
+                        self._log("[Delete] Waiting 5s for cloud to finalize previous deletions…")
+                        time.sleep(5)
                     current_layer = resource.deletion_layer
                     self._log(f"[Delete] ── Layer {current_layer} ─────────────────────")
 

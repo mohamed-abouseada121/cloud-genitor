@@ -111,12 +111,20 @@ class StateManager:
         conn = self._get_conn()
         if provider:
             rows = conn.execute(
-                "SELECT * FROM deletion_log WHERE status='FAILED' AND provider=?",
+                """SELECT * FROM deletion_log
+                   WHERE status='FAILED' AND provider=?
+                   AND resource_id NOT IN (
+                       SELECT resource_id FROM deletion_log WHERE status='SUCCESS'
+                   )""",
                 (provider,),
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT * FROM deletion_log WHERE status='FAILED'",
+                """SELECT * FROM deletion_log
+                   WHERE status='FAILED'
+                   AND resource_id NOT IN (
+                       SELECT resource_id FROM deletion_log WHERE status='SUCCESS'
+                   )""",
             ).fetchall()
         return [dict(r) for r in rows]
 
