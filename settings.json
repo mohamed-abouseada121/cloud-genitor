@@ -1,0 +1,29 @@
+{
+  "last_provider": "AWS",
+  "last_region": "",
+  "last_scan_mode": "comprehensive",
+  "dry_run": true,
+  "theme": "dark",
+  "window_geometry": {
+    "x": 140,
+    "y": 94,
+    "w": 1400,
+    "h": 850
+  },
+  "accounts": {
+    "AWS": [],
+    "Azure": [],
+    "Alibaba": [],
+    "GCP": [],
+    "Oracle": []
+  },
+  "schedule": {
+    "enabled": false,
+    "interval_minutes": 1440,
+    "notify_email": "",
+    "smtp_host": "",
+    "smtp_port": 587,
+    "smtp_user": "",
+    "smtp_password": ""
+  }
+}
