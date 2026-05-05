@@ -20,6 +20,8 @@ from models.resource import ProviderName
 class AWSCredentials:
     profile_name: str = "default"
     region: str = "us-east-1"
+    access_key_id: Optional[str] = None
+    secret_access_key: Optional[str] = None
     # Optional role assumption
     role_arn: Optional[str] = None
     external_id: Optional[str] = None
@@ -28,8 +30,9 @@ class AWSCredentials:
 @dataclass
 class AzureCredentials:
     subscription_id: str = ""
-    # DefaultAzureCredential reads env vars automatically:
-    # AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET
+    tenant_id: Optional[str] = None
+    client_id: Optional[str] = None
+    client_secret: Optional[str] = None
 
 
 @dataclass
@@ -74,10 +77,17 @@ class CredentialManager:
     def get_aws_session(self, creds: AWSCredentials) -> Any:
         import boto3
 
-        session = boto3.Session(
-            profile_name=creds.profile_name,
-            region_name=creds.region,
-        )
+        if creds.access_key_id and creds.secret_access_key:
+            session = boto3.Session(
+                aws_access_key_id=creds.access_key_id,
+                aws_secret_access_key=creds.secret_access_key,
+                region_name=creds.region,
+            )
+        else:
+            session = boto3.Session(
+                profile_name=creds.profile_name,
+                region_name=creds.region,
+            )
         if creds.role_arn:
             sts = session.client("sts")
             kwargs: dict[str, Any] = {
@@ -101,8 +111,14 @@ class CredentialManager:
     def load_azure(self, subscription_id: str) -> AzureCredentials:
         return AzureCredentials(subscription_id=subscription_id)
 
-    def get_azure_credential(self) -> Any:
-        from azure.identity import DefaultAzureCredential  # type: ignore[import]
+    def get_azure_credential(self, creds: AzureCredentials) -> Any:
+        from azure.identity import DefaultAzureCredential, ClientSecretCredential  # type: ignore[import]
+        if creds.tenant_id and creds.client_id and creds.client_secret:
+            return ClientSecretCredential(
+                tenant_id=creds.tenant_id,
+                client_id=creds.client_id,
+                client_secret=creds.client_secret
+            )
         return DefaultAzureCredential()
 
     # ── Alibaba ───────────────────────────────────────────────────────────────

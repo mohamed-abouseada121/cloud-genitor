@@ -8,7 +8,7 @@ All filters are applied client-side on the already-populated tree.
 
 from __future__ import annotations
 
-from PyQt6.QtCore import pyqtSignal
+from PyQt6.QtCore import pyqtSignal, QTimer
 from PyQt6.QtWidgets import (
     QComboBox, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QSpinBox, QWidget,
@@ -25,11 +25,24 @@ class FilterBar(QWidget):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
+        self._debounce_timer = QTimer(self)
+        self._debounce_timer.setSingleShot(True)
+        self._debounce_timer.setInterval(300)
+        self._debounce_timer.timeout.connect(self._emit_filters)
         self._build_ui()
 
     def _build_ui(self) -> None:
         layout = QHBoxLayout(self)
         layout.setContentsMargins(4, 2, 4, 2)
+
+        # ── Search filter ─────────────────────────────────────────────────────
+        layout.addWidget(QLabel("Search:"))
+        self._search_input = QLineEdit()
+        self._search_input.setPlaceholderText("Name or ID...")
+        self._search_input.setFixedWidth(150)
+        self._search_input.textChanged.connect(self._debounce_timer.start)
+        layout.addWidget(self._search_input)
+        layout.addSpacing(10)
 
         # ── Tag filter ────────────────────────────────────────────────────────
         layout.addWidget(QLabel("Tag key:"))
@@ -96,6 +109,7 @@ class FilterBar(QWidget):
 
     def current_filters(self) -> dict:
         return {
+            "search":       self._search_input.text().strip().lower(),
             "tag_key":      self._tag_key.text().strip(),
             "tag_value":    self._tag_value.text().strip(),
             "min_age_days": self._age_spin.value(),

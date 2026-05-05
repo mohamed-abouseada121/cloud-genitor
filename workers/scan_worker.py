@@ -6,7 +6,9 @@ Background worker that runs provider scans (comprehensive or hierarchical).
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from providers.base_provider import CloudProvider
 from workers.base_worker import BaseWorker
@@ -18,61 +20,88 @@ class ScanWorker(BaseWorker):
 
     Parameters
     ----------
-    provider : CloudProvider instance (already connected)
-    region   : region string, or "All Regions" to iterate all available regions
-    mode     : "comprehensive" | "hierarchical"
+    provider_factory : Callable that returns a connected CloudProvider instance
+    provider_name    : Name of the provider (for logging)
+    regions          : List of regions to scan
+    mode             : "comprehensive" | "hierarchical"
     """
 
-    def __init__(self, provider: CloudProvider, region: str, mode: str,
+    def __init__(self, provider_factory: Callable[[], CloudProvider],
+                 provider_name: str, regions: list[str], mode: str,
                  parent: Any = None) -> None:
         super().__init__(parent)
-        self._provider = provider
-        self._region   = region
-        self._mode     = mode
+        self._provider_factory = provider_factory
+        self._provider_name    = provider_name
+        self._regions          = regions
+        self._mode             = mode
 
     def run(self) -> None:
         try:
-            self._log(f"[Scan] Starting {self._mode} scan for {self._provider.provider_name} / {self._region}")
+            self._log(f"[Scan] Starting {self._mode} scan for {self._provider_name} across {len(self._regions)} region(s)")
 
-            regions = self._resolve_regions()
             all_resources = []
-            total = len(regions)
+            total = len(self._regions)
+            completed = 0
 
-            for idx, region in enumerate(regions):
-                if self._check_cancelled():
-                    self._log("[Scan] Cancelled by user.")
-                    break
+            # Single region: run synchronously to avoid overhead
+            if total == 1:
+                self._scan_region(self._regions[0], all_resources)
+                completed = 1
+                self.progress.emit(100)
+            else:
+                # Multi-region: parallelize with ThreadPoolExecutor
+                with ThreadPoolExecutor(max_workers=5) as executor:
+                    futures = {
+                        executor.submit(self._scan_region, region, None): region
+                        for region in self._regions
+                    }
 
-                self._log(f"[Scan] Scanning region: {region}")
-                try:
-                    if self._mode == "comprehensive":
-                        resources = self._provider.scan_comprehensive(region)
-                    else:
-                        resources = self._provider.scan_hierarchical(region)
+                    for future in as_completed(futures):
+                        if self._check_cancelled():
+                            self._log("[Scan] Cancelled by user. Shutting down threads...")
+                            executor.shutdown(wait=False, cancel_futures=True)
+                            break
 
-                    for r in resources:
-                        self.resource_found.emit(r)
-                    all_resources.extend(resources)
+                        try:
+                            resources = future.result()
+                            if resources:
+                                all_resources.extend(resources)
+                        except Exception as exc:
+                            region = futures[future]
+                            self._log(f"[Scan] Unhandled error scanning {region}: {exc}")
 
-                    self._log(f"[Scan] {region}: {len(resources)} resources found")
-                except Exception as exc:
-                    self._log(f"[Scan] Error scanning {region}: {exc}")
+                        completed += 1
+                        pct = int((completed) / total * 100)
+                        self.progress.emit(pct)
 
-                pct = int((idx + 1) / total * 100)
-                self.progress.emit(pct)
-
-            self._log(f"[Scan] Done — total {len(all_resources)} resources across {total} region(s)")
+            self._log(f"[Scan] Done — total {len(all_resources)} resources across {completed} region(s)")
             self.finished.emit(all_resources)
 
         except Exception as exc:
             self.error.emit(str(exc))
             self._log(f"[Scan] Fatal error: {exc}")
 
-    def _resolve_regions(self) -> list[str]:
-        if self._region.lower() == "all regions":
-            try:
-                return self._provider.list_regions()
-            except Exception as exc:
-                self._log(f"[Scan] Could not list regions: {exc}")
-                return [self._region]
-        return [self._region]
+    def _scan_region(self, region: str, out_list: list = None) -> list:
+        if self._check_cancelled():
+            return []
+
+        self._log(f"[Scan] Scanning region: {region}")
+        resources = []
+        try:
+            provider = self._provider_factory()
+            if self._mode == "comprehensive":
+                resources = provider.scan_comprehensive(region)
+            else:
+                resources = provider.scan_hierarchical(region)
+
+            for r in resources:
+                self.resource_found.emit(r)
+                
+            if out_list is not None:
+                out_list.extend(resources)
+
+            self._log(f"[Scan] {region}: {len(resources)} resources found")
+            return resources
+        except Exception as exc:
+            self._log(f"[Scan] Error scanning {region}: {exc}")
+            return []

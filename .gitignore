@@ -1,16 +1,39 @@
-venv/
+# Python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 .Python
+venv/
+.venv/
 env/
+.env
+
+# Database & Settings (SENSITIVE)
 *.db
 settings.json
+!settings.json.example
+
+# IDEs
 .vscode/
 .idea/
+.project
+.pydevproject
+.settings/
+
+# OS
 .DS_Store
-*.log
+Thumbs.db
+
+# Reports & Exports
 reports/
 *.csv
 *.pdf
+*.log
+
+# PyInstaller / Build
+dist/
+build/
+*.spec
+bin/
+obj/

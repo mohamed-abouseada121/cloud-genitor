@@ -82,34 +82,83 @@ class ResourceTree(QTreeWidget):
         """Mode A — flat list."""
         self.clear()
         self._id_to_item.clear()
+        self.setUpdatesEnabled(False)
         self._blocking_signals = True
-        for r in resources:
-            item = self._make_item(r)
-            self.addTopLevelItem(item)
-            self._id_to_item[r.resource_id] = item
-        self._blocking_signals = False
+        try:
+            for r in resources:
+                item = self._make_item(r)
+                self.addTopLevelItem(item)
+                self._id_to_item[r.resource_id] = item
+        finally:
+            self._blocking_signals = False
+            self.setUpdatesEnabled(True)
 
     def populate_tree(self, resources: list[CloudResource]) -> None:
         """Mode B — hierarchical tree grouped by parent_id."""
         self.clear()
         self._id_to_item.clear()
+        self.setUpdatesEnabled(False)
         self._blocking_signals = True
 
-        # First pass: create all items
-        for r in resources:
-            item = self._make_item(r)
-            self._id_to_item[r.resource_id] = item
+        try:
+            # Filter duplicates by ID just in case
+            unique_resources = {}
+            for r in resources:
+                if r.resource_id not in unique_resources:
+                    unique_resources[r.resource_id] = r
+            
+            res_list = list(unique_resources.values())
 
-        # Second pass: attach to parents or root
-        for r in resources:
-            item = self._id_to_item[r.resource_id]
-            if r.parent_id and r.parent_id in self._id_to_item:
-                self._id_to_item[r.parent_id].addChild(item)
+            # First pass: create all items
+            for r in res_list:
+                item = self._make_item(r)
+                self._id_to_item[r.resource_id] = item
+
+            # Second pass: attach to parents or root
+            for r in res_list:
+                item = self._id_to_item[r.resource_id]
+                if r.parent_id and r.parent_id in self._id_to_item:
+                    parent_item = self._id_to_item[r.parent_id]
+                    if parent_item != item: # Prevent self-parenting
+                        parent_item.addChild(item)
+                    else:
+                        self.addTopLevelItem(item)
+                else:
+                    self.addTopLevelItem(item)
+
+            # Only expand all if total count is reasonable
+            if len(res_list) < 500:
+                self.expandAll()
             else:
-                self.addTopLevelItem(item)
+                # Just expand top level
+                for i in range(self.topLevelItemCount()):
+                    self.topLevelItem(i).setExpanded(True)
 
-        self.expandAll()
-        self._blocking_signals = False
+        finally:
+            self._blocking_signals = False
+            self.setUpdatesEnabled(True)
+
+    def select_all(self) -> None:
+        self.setUpdatesEnabled(False)
+        self._blocking_signals = True
+        try:
+            for item in self._id_to_item.values():
+                item.setCheckState(COL_NAME, Qt.CheckState.Checked)
+        finally:
+            self._blocking_signals = False
+            self.setUpdatesEnabled(True)
+        self.selection_changed.emit(len(self._id_to_item))
+
+    def select_none(self) -> None:
+        self.setUpdatesEnabled(False)
+        self._blocking_signals = True
+        try:
+            for item in self._id_to_item.values():
+                item.setCheckState(COL_NAME, Qt.CheckState.Unchecked)
+        finally:
+            self._blocking_signals = False
+            self.setUpdatesEnabled(True)
+        self.selection_changed.emit(0)
 
     def get_checked_resources(self) -> list[CloudResource]:
         """Return CloudResource objects for all checked (leaf or parent) items."""
@@ -125,12 +174,16 @@ class ResourceTree(QTreeWidget):
 
     def apply_filters(self, filters: dict) -> None:
         """Show/hide items based on filter criteria."""
+        search    = filters.get("search", "")
         tag_key   = filters.get("tag_key", "")
         tag_value = filters.get("tag_value", "")
         min_age   = filters.get("min_age_days", 0)
         min_cost  = filters.get("min_cost", 0.0)
 
         def _matches(r: CloudResource) -> bool:
+            if search:
+                if search not in r.display_name.lower() and search not in r.resource_id.lower():
+                    return False
             if min_age > 0 and 0 <= r.age_days < min_age:
                 return False
             if min_cost > 0 and r.estimated_cost < min_cost:
@@ -146,10 +199,14 @@ class ResourceTree(QTreeWidget):
                         return False
             return True
 
-        for resource_id, item in self._id_to_item.items():
-            resource = item.data(COL_NAME, Qt.ItemDataRole.UserRole)
-            if resource:
-                item.setHidden(not _matches(resource))
+        self.setUpdatesEnabled(False)
+        try:
+            for resource_id, item in self._id_to_item.items():
+                resource = item.data(COL_NAME, Qt.ItemDataRole.UserRole)
+                if resource:
+                    item.setHidden(not _matches(resource))
+        finally:
+            self.setUpdatesEnabled(True)
 
     def update_deletion_status(self, resource_id: str, status: DeletionStatus) -> None:
         item = self._id_to_item.get(resource_id)

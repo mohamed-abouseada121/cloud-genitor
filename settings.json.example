@@ -1,0 +1,48 @@
+{
+  "last_provider": "AWS",
+  "last_region": "us-east-1",
+  "theme": "dark",
+  "dry_run": true,
+  "accounts": {
+    "AWS": [
+      {
+        "name": "default",
+        "profile_name": "default",
+        "region": "us-east-1",
+        "access_key_id": "",
+        "access_key_secret": ""
+      }
+    ],
+    "Azure": [
+      {
+        "name": "default",
+        "subscription_id": "",
+        "tenant_id": "",
+        "client_id": "",
+        "client_secret": ""
+      }
+    ],
+    "GCP": [
+      {
+        "name": "default",
+        "project_id": "my-project-id",
+        "key_file": ""
+      }
+    ],
+    "Alibaba": [
+      {
+        "name": "default",
+        "access_key_id": "",
+        "access_key_secret": "",
+        "region_id": "me-central-1"
+      }
+    ],
+    "Oracle": [
+      {
+        "name": "default",
+        "config_file": "~/.oci/config",
+        "profile_name": "DEFAULT"
+      }
+    ]
+  }
+}

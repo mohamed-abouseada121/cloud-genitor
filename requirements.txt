@@ -9,20 +9,54 @@ azure-identity>=1.14.0,<2.0
 azure-mgmt-resource>=23.0.0,<24.0
 azure-mgmt-compute>=30.0.0,<32.0
 azure-mgmt-network>=25.0.0,<26.0
+azure-mgmt-sql>=4.0.0
+azure-mgmt-storage>=21.0.0,<22.0
+# Phase 2
+azure-mgmt-cosmosdb>=9.0.0
+azure-mgmt-redis>=14.0.0
+azure-mgmt-servicebus>=8.0.0
+azure-mgmt-dns>=8.0.0
+azure-mgmt-cdn>=13.0.0
+azure-mgmt-web>=7.0.0
+azure-mgmt-containerregistry>=10.0.0
+# Phase 3
+azure-mgmt-containerinstance>=10.0.0
+azure-mgmt-keyvault>=10.0.0
+azure-mgmt-monitor>=5.0.0
 
 # ── GCP ──────────────────────────────────────────────────────────────────────
 google-cloud-compute>=1.14.0,<2.0
 google-cloud-resource-manager>=1.10.0,<2.0
+google-cloud-sqladmin>=0.0.1
+google-cloud-storage>=2.10.0,<3.0
 google-auth>=2.22.0,<3.0
+google-cloud-container>=2.30.0
+# Phase 2
+google-cloud-functions>=1.8.0
+google-cloud-pubsub>=2.18.0
+google-cloud-redis>=2.12.0
+google-cloud-dns>=0.35.0
+# Phase 3
+google-cloud-secret-manager>=2.16.0
+google-cloud-monitoring>=2.15.0
 
 # ── Alibaba Cloud ────────────────────────────────────────────────────────────
 alibabacloud-ecs20140526>=3.0.0,<4.0
 alibabacloud-vpc20160428>=3.0.0,<4.0
+alibabacloud-rds20140815>=3.0.0,<4.0
+alibabacloud-cs20151215>=5.0.0,<6.0
+alibabacloud-slb20140515>=3.0.0,<4.0
 alibabacloud-tea-openapi>=0.3.0,<1.0
 alibabacloud-credentials>=1.0.0,<2.0
+oss2>=2.18.0,<3.0
+# Phase 3 (Optional)
+alibabacloud-fc-open20210406>=2.0.0
+alibabacloud-cr20181201>=2.0.0
+alibabacloud-alidns20150109>=3.0.0
 
 # ── Oracle Cloud ─────────────────────────────────────────────────────────────
 oci>=2.110.0,<3.0
 
 # ── Reports ──────────────────────────────────────────────────────────────────
 fpdf2>=2.7.0,<3.0
+azure-mgmt-containerservice>=41.0.0

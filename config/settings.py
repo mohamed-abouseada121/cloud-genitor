@@ -49,13 +49,18 @@ class Settings:
     # ── persistence ──────────────────────────────────────────────────────────
 
     def load(self) -> None:
-        if os.path.isfile(self._path):
-            with open(self._path, "r", encoding="utf-8") as fh:
-                stored = json.load(fh)
-            # Merge stored over defaults (shallow)
-            self._data = {**_DEFAULTS, **stored}
-        else:
-            self._data = dict(_DEFAULTS)
+        self._data = dict(_DEFAULTS)
+        if os.path.isfile(self._path) and os.path.getsize(self._path) > 0:
+            try:
+                with open(self._path, "r", encoding="utf-8") as fh:
+                    content = fh.read().strip()
+                    if content:
+                        stored = json.loads(content)
+                        # Merge stored over defaults (shallow)
+                        self._data.update(stored)
+            except (json.JSONDecodeError, Exception) as exc:
+                # If file is corrupt, fall back to defaults (already set)
+                print(f"Warning: Could not load settings from {self._path}: {exc}")
 
     def save(self) -> None:
         with open(self._path, "w", encoding="utf-8") as fh:

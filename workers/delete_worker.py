@@ -39,12 +39,14 @@ class DeleteWorker(BaseWorker):
         resources: list[CloudResource],
         dry_run: bool = False,
         state_manager: Any = None,
+        retry: bool = False,
         parent: Any = None,
     ) -> None:
         super().__init__(parent)
         self._provider      = provider
         self._resources     = resources
         self._dry_run       = dry_run
+        self._retry         = retry
         self._state_manager: StateManager | None = state_manager
 
     def run(self) -> None:
@@ -95,32 +97,40 @@ class DeleteWorker(BaseWorker):
                 if self._state_manager and not self._dry_run:
                     self._state_manager.log_attempt(resource)
 
-                try:
-                    result = self._provider.delete_resource(resource, dry_run=self._dry_run)
-                    resource.deletion_status = DeletionStatus.SKIPPED if self._dry_run else DeletionStatus.SUCCESS
-                    self._log(f"[Delete] ✓ {result}")
+                max_attempts = 3 if self._retry else 1
+                for attempt in range(max_attempts):
+                    try:
+                        result = self._provider.delete_resource(resource, dry_run=self._dry_run)
+                        resource.deletion_status = DeletionStatus.SKIPPED if self._dry_run else DeletionStatus.SUCCESS
+                        self._log(f"[Delete] ✓ {result}")
 
-                    if self._state_manager and not self._dry_run:
-                        self._state_manager.mark_success(resource.resource_id)
+                        if self._state_manager and not self._dry_run:
+                            self._state_manager.mark_success(resource.resource_id)
 
-                    self.resource_deleted.emit(resource, result)
-                    succeeded += 1
+                        self.resource_deleted.emit(resource, result)
+                        succeeded += 1
+                        break  # Success, exit retry loop
 
-                except Exception as exc:
-                    error_msg = str(exc)
-                    resource.deletion_status = DeletionStatus.FAILED
-                    resource.error_message   = error_msg
-                    self._log(f"[Delete] ✗ Failed: {resource.display_name} — {error_msg}")
+                    except Exception as exc:
+                        error_msg = str(exc)
+                        if attempt < max_attempts - 1:
+                            self._log(f"[Delete] ⚠ Deletion failed for {resource.display_name}: {error_msg} — retrying ({attempt+1}/{max_attempts}) in 3s...")
+                            import time
+                            time.sleep(3)
+                        else:
+                            resource.deletion_status = DeletionStatus.FAILED
+                            resource.error_message   = error_msg
+                            self._log(f"[Delete] ✗ Failed: {resource.display_name} — {error_msg}")
 
-                    if self._state_manager and not self._dry_run:
-                        self._state_manager.mark_failed(resource.resource_id, error_msg)
+                            if self._state_manager and not self._dry_run:
+                                self._state_manager.mark_failed(resource.resource_id, error_msg)
 
-                    # Block all higher layers from proceeding
-                    for layer in range(resource.deletion_layer + 1, 6):
-                        failed_layers.add(layer)
+                            # Block all higher layers from proceeding
+                            for layer in range(resource.deletion_layer + 1, 6):
+                                failed_layers.add(layer)
 
-                    self.resource_deleted.emit(resource, f"FAILED: {error_msg}")
-                    failed += 1
+                            self.resource_deleted.emit(resource, f"FAILED: {error_msg}")
+                            failed += 1
 
                 pct = int((idx + 1) / total * 100)
                 self.progress.emit(pct)

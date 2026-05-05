@@ -26,6 +26,7 @@ _LAYER: dict[ResourceType, int] = {
     # Layer 1 – compute / database
     ResourceType.INSTANCE:         1,
     ResourceType.RDS:              1,
+    ResourceType.CLOUD_SQL:        1,
     ResourceType.LOAD_BALANCER:    1,
     # Layer 2 – attached resources
     ResourceType.NIC:              2,
@@ -77,9 +78,9 @@ def get_safe_deletion_order(resources: Iterable[CloudResource]) -> list[CloudRes
     # Index by id
     by_id: dict[str, CloudResource] = {r.resource_id: r for r in res_list}
 
-    # Assign layers
-    for r in res_list:
-        r.deletion_layer = assign_deletion_layer(r)
+    # Assign layers (Skipped to preserve provider-specific overrides)
+    # for r in res_list:
+    #     r.deletion_layer = assign_deletion_layer(r)
 
     # Group by layer
     layers: dict[int, list[CloudResource]] = defaultdict(list)

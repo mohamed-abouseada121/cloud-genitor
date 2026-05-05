@@ -36,17 +36,83 @@ class ResourceType(str, Enum):
     FIREWALL_RULE    = "Firewall Rule"
     # Compute
     INSTANCE         = "Instance"
-    # Storage
+    # Storage — Block
     DISK             = "Disk"
     EBS_VOLUME       = "EBS Volume"
     BLOCK_VOLUME     = "Block Volume"
+    # Storage — Object
+    S3_BUCKET        = "S3 Bucket"
+    BLOB_STORAGE     = "Blob Storage"
+    GCS_BUCKET       = "GCS Bucket"
+    OSS_BUCKET       = "OSS Bucket"
     # IP
     EIP              = "EIP"
     PUBLIC_IP        = "Public IP"
     # Database
     RDS              = "RDS"
-    # Containers / High-level
+    CLOUD_SQL        = "Cloud SQL"
+    DB_INSTANCE      = "Database Instance"
+    # Load Balancers
     LOAD_BALANCER    = "Load Balancer"
+    LB_ALB           = "ALB"
+    LB_NLB           = "NLB"
+    LB_CLASSIC       = "Classic LB"
+    APP_GATEWAY      = "Application Gateway"
+    AZURE_LB         = "Azure Load Balancer"
+    GCP_LB           = "GCP Load Balancer"
+    ALIBABA_SLB      = "Alibaba SLB"
+    ORACLE_LB        = "Oracle Load Balancer"
+    # Serverless / Functions
+    LAMBDA_FUNCTION  = "Lambda Function"
+    AZURE_FUNCTION   = "Azure Function"
+    CLOUD_FUNCTION   = "Cloud Function"
+    ALIBABA_FUNCTION = "Alibaba Function Compute"
+    ORACLE_FUNCTION  = "Oracle Function"
+    # Container Services
+    FARGATE_TASK     = "Fargate Task"
+    CONTAINER_INSTANCE = "Container Instance"
+    # Container Registries
+    ECR_REPO         = "ECR Repository"
+    ACR_REPO         = "ACR Repository"
+    GCR_REPO         = "GCR Repository"
+    ALIBABA_CR       = "Alibaba Container Registry"
+    # NoSQL Databases
+    DYNAMODB_TABLE   = "DynamoDB Table"
+    COSMOS_DB        = "CosmosDB Account"
+    ORACLE_NOSQL     = "Oracle NoSQL Database"
+    # Caching
+    ELASTICACHE      = "ElastiCache Cluster"
+    AZURE_REDIS      = "Azure Redis Cache"
+    GCP_MEMORYSTORE  = "GCP Memorystore"
+    # Messaging & Queuing
+    SQS_QUEUE        = "SQS Queue"
+    SNS_TOPIC        = "SNS Topic"
+    SERVICE_BUS      = "Azure Service Bus"
+    PUBSUB_TOPIC     = "GCP Pub/Sub Topic"
+    ALIBABA_MNS      = "Alibaba MNS"
+    # DNS & CDN
+    ROUTE53_ZONE     = "Route53 Hosted Zone"
+    CLOUDFRONT       = "CloudFront Distribution"
+    AZURE_DNS        = "Azure DNS Zone"
+    AZURE_CDN        = "Azure Front Door"
+    GCP_DNS          = "GCP DNS Zone"
+    ALIBABA_DNS      = "Alibaba DNS"
+    # Oracle extras
+    OCI_BUCKET       = "OCI Object Storage Bucket"
+    
+    # Secrets Management
+    AWS_SECRET       = "AWS Secret"
+    KEY_VAULT        = "Azure Key Vault"
+    GCP_SECRET       = "GCP Secret"
+
+    # Monitoring
+    CLOUDWATCH_ALARM = "CloudWatch Alarm"
+    AZURE_MONITOR_ALERT = "Azure Monitor Alert"
+    GCP_ALERT_POLICY = "GCP Alert Policy"
+    # Containers / High-level
+    KUBERNETES       = "Kubernetes Cluster"
+    KUBERNETES_NODE_GROUP = "Kubernetes Node Group"
+    KUBERNETES_ADDON = "Kubernetes Addon"
     # Organisational
     RESOURCE_GROUP   = "Resource Group"
     COMPARTMENT      = "Compartment"
