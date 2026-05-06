@@ -41,17 +41,12 @@ def _clean_text(text: str) -> str:
     }
     for search, replace in replacements.items():
         text = text.replace(search, replace)
-    # Fallback: encode to latin-1 and ignore errors, then decode back
-    return text.encode("latin-1", errors="ignore").decode("latin-1")
+    
+    # Aggressive fallback: convert to ASCII
+    return text.encode("ascii", errors="ignore").decode("ascii")
 
-
-# ── CSV ───────────────────────────────────────────────────────────────────────
 
 def export_csv(resources: Iterable[CloudResource], filename: str = "") -> str:
-    """
-    Write resources to a CSV file.
-    Returns the absolute path of the created file.
-    """
     out_dir = _ensure_reports_dir()
     if not filename:
         filename = f"cleanup_report_{_timestamp()}.csv"
@@ -83,17 +78,11 @@ def export_csv(resources: Iterable[CloudResource], filename: str = "") -> str:
     return path
 
 
-# ── PDF ───────────────────────────────────────────────────────────────────────
-
 def export_pdf(resources: Iterable[CloudResource],
                title: str = "Cloud Janitor Report",
                filename: str = "") -> str:
-    """
-    Write resources to a PDF table using fpdf2.
-    Returns the absolute path of the created file.
-    """
     try:
-        from fpdf import FPDF  # type: ignore[import]
+        from fpdf import FPDF
     except ImportError:
         raise ImportError("fpdf2 is required: pip install fpdf2")
 
@@ -109,7 +98,7 @@ def export_pdf(resources: Iterable[CloudResource],
     pdf.set_auto_page_break(auto=True, margin=10)
     pdf.add_page()
 
-    # ── Title ──────────────────────────────────────────────────────────
+    # Title
     pdf.set_font("Helvetica", "B", 14)
     pdf.cell(0, 10, _clean_text(title), ln=True, align="C")
     pdf.set_font("Helvetica", "", 9)
@@ -120,9 +109,9 @@ def export_pdf(resources: Iterable[CloudResource],
              ln=True, align="C")
     pdf.ln(4)
 
-    # ── Table header ───────────────────────────────────────────────────
-    headers   = ["Name", "Type", "Provider", "Region", "Status", "Cost/mo", "Del. Status"]
-    col_widths = [55, 32, 22, 35, 22, 22, 28]
+    # Table header
+    headers   = ["Name", "Type", "Provider", "Region", "Age", "Cost/mo", "Status"]
+    col_widths = [50, 28, 18, 30, 15, 20, 55]
 
     pdf.set_font("Helvetica", "B", 8)
     pdf.set_fill_color(40, 40, 40)
@@ -131,20 +120,20 @@ def export_pdf(resources: Iterable[CloudResource],
         pdf.cell(w, 7, h, border=1, fill=True, align="C")
     pdf.ln()
 
-    # ── Table rows ─────────────────────────────────────────────────────
+    # Table rows
     pdf.set_font("Helvetica", "", 7)
     pdf.set_text_color(0, 0, 0)
     fill = False
     for r in res_list:
         pdf.set_fill_color(235, 235, 235) if fill else pdf.set_fill_color(255, 255, 255)
         row_data = [
-            r.display_name[:40],
+            r.display_name[:35],
             r.resource_type.value,
             r.provider.value,
             r.region,
-            r.status[:18],
+            f"{r.age_days}d",
             r.cost_label,
-            r.deletion_status.value if r.deletion_status else "–",
+            r.status[:40],
         ]
         for val, w in zip(row_data, col_widths):
             pdf.cell(w, 6, _clean_text(val), border=1, fill=True)

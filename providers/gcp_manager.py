@@ -16,8 +16,22 @@ from typing import Any, Optional
 
 from models.resource import CloudResource, ProviderName, ResourceType
 from providers.base_provider import CloudProvider
-from utils.credentials import GCPCredentials
+from utils.credentials import GCPCredentials, CredentialManager
 from utils.pagination import gcp_paginate
+
+# GCP SDK Imports
+try:
+    from google.cloud import compute_v1
+    from google.cloud import container_v1
+    from google.cloud import functions_v1
+    from google.cloud import pubsub_v1
+    from google.cloud import redis_v1
+    from google.cloud import dns_v1
+    from google.cloud import secretmanager_v1
+    from google.cloud import monitoring_v1
+    from googleapiclient.discovery import build
+except ImportError:
+    pass
 
 log = logging.getLogger(__name__)
 
@@ -70,7 +84,7 @@ class GCPManager(CloudProvider):
 
     # ── connection ────────────────────────────────────────────────────────────
 
-    def connect(self, credentials: GCPCredentials) -> bool:
+    def connect(self, credentials: GCPCredentials, test_connection: bool = True) -> bool:
         try:
             from google.cloud import compute_v1  # type: ignore
             from utils.credentials import CredentialManager
@@ -90,7 +104,7 @@ class GCPManager(CloudProvider):
 
             # Cloud SQL Client
             from googleapiclient.discovery import build
-            self._sql_client = build("sqladmin", "v1beta4", credentials=self._credentials)
+            self._sql_client = build("sqladmin", "v1beta4", credentials=self._credentials, cache_discovery=False)
 
             # GKE Client
             try:
@@ -186,26 +200,28 @@ class GCPManager(CloudProvider):
         if not self._networks_client:
             self._emit("[GCP] Error: Provider not connected or clients not initialized.")
             return []
+            
+        from concurrent.futures import ThreadPoolExecutor
+        tasks = [
+            self._scan_networks, self._scan_subnetworks, self._scan_all_instances,
+            self._scan_all_disks, self._scan_firewalls, self._scan_sql_instances,
+            self._scan_addresses, self._scan_gke_clusters, self._scan_nat_gateways,
+            self._scan_gcs_buckets, self._scan_gcp_load_balancers,
+            self._scan_cloud_functions, self._scan_pubsub_topics,
+            self._scan_gcp_redis, self._scan_gcp_dns_zones,
+            self._scan_secret_manager, self._scan_alert_policies
+        ]
+        
         resources: list[CloudResource] = []
-        resources.extend(self._scan_networks())
-        resources.extend(self._scan_subnetworks())
-        resources.extend(self._scan_all_instances())
-        resources.extend(self._scan_all_disks())
-        resources.extend(self._scan_firewalls())
-        resources.extend(self._scan_sql_instances())
-        resources.extend(self._scan_addresses())
-        resources.extend(self._scan_gke_clusters())
-        resources.extend(self._scan_nat_gateways())
-        resources.extend(self._scan_gcs_buckets())
-        resources.extend(self._scan_gcp_load_balancers())
-        # Phase 2
-        resources.extend(self._scan_cloud_functions())
-        resources.extend(self._scan_pubsub_topics())
-        resources.extend(self._scan_gcp_redis())
-        resources.extend(self._scan_gcp_dns_zones())
-        # Phase 3
-        resources.extend(self._scan_secret_manager())
-        resources.extend(self._scan_alert_policies())
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = [executor.submit(t) for t in tasks]
+            for f in futures:
+                try:
+                    res = f.result()
+                    if res: resources.extend(res)
+                except Exception as e:
+                    self._emit(f"[GCP] Internal scan error: {e}")
+                    
         self._emit(f"[GCP] Hierarchical scan done — {len(resources)} resources")
         return resources
 
@@ -373,12 +389,13 @@ class GCPManager(CloudProvider):
 
     def _make_resource(self, rid, name, rtype, parent_id=None,
                        status="", metadata=None, layer=1,
-                       estimated_cost=0.0) -> CloudResource:
+                       estimated_cost=0.0, age_days=0) -> CloudResource:
         return CloudResource(
             resource_id=rid, name=name, resource_type=rtype,
             provider=ProviderName.GCP, region=self._project_id,
             parent_id=parent_id, deletion_layer=layer,
             status=status, estimated_cost=estimated_cost,
+            age_days=age_days,
             metadata=metadata or {},
         )
 
@@ -437,6 +454,8 @@ class GCPManager(CloudProvider):
                     status=status,
                     metadata={"zone": zone},
                     layer=1,
+                    estimated_cost=30.0 if status == "RUNNING" else 0.0,
+                    age_days=self._get_age(inst),
                 ))
         return resources
 
@@ -466,7 +485,9 @@ class GCPManager(CloudProvider):
                     disk.name, disk.name, ResourceType.DISK,
                     status="unattached" if not users else "attached",
                     metadata={"zone": zone, "users": users},
-                    layer=2, estimated_cost=cost if not users else 0.0,
+                    layer=2, 
+                    estimated_cost=cost if not users else 0.0,
+                    age_days=self._get_age(disk),
                 ))
                 # Add dependencies to the last added resource
                 resources[-1].dependencies = deps
@@ -528,6 +549,8 @@ class GCPManager(CloudProvider):
                         status=status,
                         metadata={"region": region, "address": addr.address},
                         layer=2,
+                        estimated_cost=3.65 if status == "RESERVED" else 0.0,
+                        age_days=self._get_age(addr),
                     ))
         except Exception as exc:
             self._emit(f"[GCP] Error scanning addresses: {exc}")
@@ -544,7 +567,8 @@ class GCPManager(CloudProvider):
                     parent_id=cluster.network,
                     status=cluster.status.name,
                     metadata={"zone": cluster.location, "name": cluster.name},
-                    layer=2,
+                    layer=2, estimated_cost=73.0,
+                    age_days=self._get_age(cluster),
                 ))
                 
                 # Scan node pools
@@ -607,7 +631,8 @@ class GCPManager(CloudProvider):
                         "created":        str(bucket.time_created),
                     },
                     layer=1,
-                    estimated_cost=0.0,  # Requires size data to estimate
+                    estimated_cost=1.0,  # Average base storage cost
+                    age_days=self._get_age(bucket),
                 ))
         except Exception as exc:
             self._emit(f"[GCP] Error scanning GCS buckets: {exc}")

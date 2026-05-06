@@ -9,8 +9,11 @@ from __future__ import annotations
 
 import sqlite3
 import os
-from datetime import datetime
-from typing import Optional
+import json
+import logging
+from datetime import datetime, timezone
+from threading import Lock
+from typing import Any, Optional
 
 from models.resource import CloudResource, DeletionStatus
 
@@ -28,10 +31,16 @@ class StateManager:
     # ── Connection ────────────────────────────────────────────────────────────
 
     def _get_conn(self) -> sqlite3.Connection:
-        if self._conn is None:
-            self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
-            self._conn.row_factory = sqlite3.Row
-        return self._conn
+        import threading
+        if not hasattr(self, "_local"):
+            self._local = threading.local()
+        
+        if not hasattr(self._local, "conn"):
+            self._local.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            self._local.conn.row_factory = sqlite3.Row
+            if not hasattr(self, "_write_lock"):
+                self._write_lock = Lock()
+        return self._local.conn
 
     def _init_db(self) -> None:
         conn = self._get_conn()
@@ -58,6 +67,26 @@ class StateManager:
                 resources_found INTEGER DEFAULT 0,
                 scanned_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
+
+            CREATE TABLE IF NOT EXISTS scan_cache (
+                provider        TEXT    NOT NULL,
+                region          TEXT    NOT NULL,
+                mode            TEXT    NOT NULL,
+                data            TEXT    NOT NULL,
+                cached_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (provider, region, mode)
+            );
+
+            CREATE TABLE IF NOT EXISTS scan_schedule (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider        TEXT    NOT NULL,
+                regions         TEXT    NOT NULL, -- JSON list
+                mode            TEXT    NOT NULL,
+                interval_hours  INTEGER NOT NULL,
+                last_run        TIMESTAMP,
+                next_run        TIMESTAMP,
+                is_active       INTEGER DEFAULT 1
+            );
         """)
         conn.commit()
 
@@ -83,7 +112,7 @@ class StateManager:
             """UPDATE deletion_log
                SET status='SUCCESS', completed_at=?, snapshot_id=?
                WHERE resource_id=? AND status='PENDING'""",
-            (datetime.utcnow().isoformat(), snapshot_id, resource_id),
+            (datetime.now(timezone.utc).isoformat(), snapshot_id, resource_id),
         )
         conn.commit()
 
@@ -93,7 +122,7 @@ class StateManager:
             """UPDATE deletion_log
                SET status='FAILED', completed_at=?, error_message=?
                WHERE resource_id=? AND status='PENDING'""",
-            (datetime.utcnow().isoformat(), error, resource_id),
+            (datetime.now(timezone.utc).isoformat(), error, resource_id),
         )
         conn.commit()
 
@@ -103,7 +132,7 @@ class StateManager:
             """UPDATE deletion_log
                SET status='BLOCKED', completed_at=?
                WHERE resource_id=? AND status='PENDING'""",
-            (datetime.utcnow().isoformat(), resource_id),
+            (datetime.now(timezone.utc).isoformat(), resource_id),
         )
         conn.commit()
 
@@ -167,6 +196,76 @@ class StateManager:
             (provider, region, mode),
         ).fetchone()
         return row["resources_found"] if row else 0
+
+    # ── Scan Caching ──────────────────────────────────────────────────────────
+
+    def get_cached_scan(self, provider: str, region: str, mode: str, max_age_min: int = 10) -> Optional[str]:
+        """Returns JSON string of resources if cache is fresh enough."""
+        row = self._get_conn().execute(
+            f"""SELECT data FROM scan_cache
+               WHERE provider=? AND region=? AND mode=?
+               AND cached_at > datetime('now', '-{max_age_min} minutes')""",
+            (provider, region, mode),
+        ).fetchone()
+        return row["data"] if row else None
+
+    def set_cached_scan(self, provider: str, region: str, mode: str, data_json: str) -> None:
+        conn = self._get_conn()
+        with self._write_lock:
+            with conn:
+                conn.execute(
+                    """INSERT OR REPLACE INTO scan_cache (provider, region, mode, data, cached_at)
+                       VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)""",
+                    (provider, region, mode, data_json),
+                )
+        conn.commit()
+
+    def clear_scan_cache(self, provider: str, region: Optional[str] = None) -> None:
+        """Removes cached scan results for a specific provider. Optional region filter."""
+        conn = self._get_conn()
+        with self._write_lock:
+            with conn:
+                if region:
+                    conn.execute(
+                        "DELETE FROM scan_cache WHERE provider=? AND region=?",
+                        (provider, region),
+                    )
+                else:
+                    conn.execute(
+                        "DELETE FROM scan_cache WHERE provider=?",
+                        (provider,),
+                    )
+        conn.commit()
+
+    # ── Scheduling ────────────────────────────────────────────────────────────
+
+    def add_schedule(self, provider: str, regions: list[str], mode: str, interval: int) -> None:
+        import json
+        conn = self._get_conn()
+        next_run = datetime.utcnow().isoformat() # Run now if first time? No, let's say + interval
+        conn.execute(
+            """INSERT INTO scan_schedule (provider, regions, mode, interval_hours, next_run)
+               VALUES (?, ?, ?, ?, datetime('now', '+' || ? || ' hours'))""",
+            (provider, json.dumps(regions), mode, interval, interval),
+        )
+        conn.commit()
+
+    def get_active_schedules(self) -> list[dict]:
+        rows = self._get_conn().execute(
+            "SELECT * FROM scan_schedule WHERE is_active=1"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def update_schedule_run(self, schedule_id: int) -> None:
+        conn = self._get_conn()
+        conn.execute(
+            """UPDATE scan_schedule 
+               SET last_run=CURRENT_TIMESTAMP, 
+                   next_run=datetime('now', '+' || interval_hours || ' hours')
+               WHERE id=?""",
+            (schedule_id,),
+        )
+        conn.commit()
 
     # ── Cleanup ───────────────────────────────────────────────────────────────
 

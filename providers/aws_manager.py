@@ -23,8 +23,9 @@ from models.resource import (
     CloudResource, DeletionStatus, ProviderName, ResourceType,
 )
 from providers.base_provider import CloudProvider
-from utils.credentials import AWSCredentials
+from utils.credentials import AWSCredentials, CredentialManager
 from utils.pagination import aws_paginate
+from botocore.config import Config
 
 log = logging.getLogger(__name__)
 
@@ -58,15 +59,22 @@ class AWSManager(CloudProvider):
 
     # ── connection ────────────────────────────────────────────────────────────
 
-    def connect(self, credentials: AWSCredentials) -> bool:
+    def connect(self, credentials: AWSCredentials, test_connection: bool = True) -> bool:
         try:
-            from utils.credentials import CredentialManager
-            mgr = CredentialManager()
-            self._session = mgr.get_aws_session(credentials)
+            self._session = CredentialManager().get_aws_session(credentials)
             self._region  = credentials.region
-            # Quick connectivity test
-            self._ec2().describe_account_attributes()
-            self._emit(f"[AWS] Connected — profile={credentials.profile_name} region={self._region}")
+            self._config = Config(
+                connect_timeout=5,
+                read_timeout=10,
+                retries={'max_attempts': 1}
+            )
+            
+            if test_connection:
+                # Quick connectivity test
+                test_config = Config(connect_timeout=10, read_timeout=10, retries={'max_attempts': 0})
+                self._session.client("ec2", region_name=self._region, config=test_config).describe_account_attributes()
+                self._emit(f"[AWS] Connected — profile={credentials.profile_name} region={self._region}")
+            
             return True
         except Exception as exc:
             self._emit(f"[AWS] Connection failed: {exc}")
@@ -95,38 +103,51 @@ class AWSManager(CloudProvider):
         self._emit(f"[AWS] Comprehensive scan done — {len(resources)} orphans found in {region}")
         return resources
 
-    def scan_hierarchical(self, region: str) -> list[CloudResource]:
+    def scan_hierarchical(self, region: str, scan_global: bool = False) -> list[CloudResource]:
         """Return all resources ordered for tree display."""
         if not self._session:
             return []
         self._region = region
+        # Internal parallelism: scan multiple AWS services at once
+        from concurrent.futures import ThreadPoolExecutor
+        tasks = [
+            self._scan_vpcs, self._scan_subnets, self._scan_instances,
+            self._scan_ebs_volumes, self._scan_eips, self._scan_rds,
+            self._scan_internet_gateways, self._scan_nat_gateways,
+            self._scan_eks, self._scan_route_tables, self._scan_security_groups,
+            self._scan_load_balancers
+        ]
+        
+        # Only scan global services if requested
+        if scan_global:
+            tasks.extend([
+                self._scan_s3_buckets, self._scan_lambdas, self._scan_ecr_repos,
+                self._scan_dynamodb_tables, self._scan_elasticache_clusters,
+                self._scan_sqs_queues, self._scan_sns_topics,
+                self._scan_route53_zones, self._scan_cloudfront_distributions,
+                self._scan_ecs_clusters, self._scan_secrets,
+                self._scan_cloudwatch_alarms
+            ])
+
         resources: list[CloudResource] = []
-        resources.extend(self._scan_vpcs())
-        resources.extend(self._scan_subnets())
-        resources.extend(self._scan_instances())
-        resources.extend(self._scan_ebs_volumes())
-        resources.extend(self._scan_eips())
-        resources.extend(self._scan_rds())
-        resources.extend(self._scan_internet_gateways())
-        resources.extend(self._scan_nat_gateways())
-        resources.extend(self._scan_eks())
-        resources.extend(self._scan_route_tables())
-        resources.extend(self._scan_security_groups())
-        resources.extend(self._scan_s3_buckets())
-        resources.extend(self._scan_load_balancers())
-        # Phase 2
-        resources.extend(self._scan_lambdas())
-        resources.extend(self._scan_ecr_repos())
-        resources.extend(self._scan_dynamodb_tables())
-        resources.extend(self._scan_elasticache_clusters())
-        resources.extend(self._scan_sqs_queues())
-        resources.extend(self._scan_sns_topics())
-        resources.extend(self._scan_route53_zones())
-        resources.extend(self._scan_cloudfront_distributions())
-        # Phase 3
-        resources.extend(self._scan_ecs_clusters())
-        resources.extend(self._scan_secrets())
-        resources.extend(self._scan_cloudwatch_alarms())
+        from concurrent.futures import as_completed
+        skipped = False
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            future_to_task = {executor.submit(t): t.__name__ for t in tasks}
+            for f in as_completed(future_to_task):
+                try:
+                    res = f.result()
+                    if res: resources.extend(res)
+                except Exception as e:
+                    err_str = str(e)
+                    # Handle common auth/region-not-enabled errors gracefully
+                    if any(x in err_str for x in ["UnrecognizedClientException", "InvalidAccessKeyId", "AuthFailure", "InvalidClientTokenId"]):
+                         if not skipped:
+                             self._emit(f"[AWS] Region {region} access denied (opt-in required?) - skipping.")
+                             skipped = True
+                    else:
+                         self._emit(f"[AWS] Internal scan error in {region}: {e}")
+        
         self._emit(f"[AWS] Hierarchical scan done — {len(resources)} resources in {region}")
         return resources
 
@@ -134,115 +155,125 @@ class AWSManager(CloudProvider):
 
     def delete_resource(self, resource: CloudResource, dry_run: bool = False) -> str:
         prefix = "[DRY RUN] " if dry_run else ""
-        self._emit(f"{prefix}[AWS] Deleting {resource.resource_type.value}: {resource.display_name}")
+        self._emit(f"{prefix}[AWS] Deleting {resource.resource_type.value}: {resource.display_name} in {resource.region}")
 
         if dry_run:
             return f"DRY RUN: would delete {resource.resource_type.value} {resource.resource_id}"
 
-        handlers = {
-            ResourceType.INSTANCE:         self._delete_instance,
-            ResourceType.EBS_VOLUME:       self._delete_ebs,
-            ResourceType.EIP:              self._delete_eip,
-            ResourceType.RDS:              self._delete_rds,
-            ResourceType.INTERNET_GATEWAY: self._delete_igw,
-            ResourceType.NAT_GATEWAY:      self._delete_nat_gw,
-            ResourceType.KUBERNETES:       self._delete_eks,
-            ResourceType.KUBERNETES_NODE_GROUP: self._delete_eks_nodegroup,
-            ResourceType.KUBERNETES_ADDON: self._delete_eks_addon,
-            ResourceType.SUBNET:           self._delete_subnet,
-            ResourceType.ROUTE_TABLE:      self._delete_route_table,
-            ResourceType.SECURITY_GROUP:   self._delete_security_group,
-            ResourceType.VPC:              self._delete_vpc,
-            ResourceType.S3_BUCKET:        self._delete_s3_bucket,
-            ResourceType.LB_ALB:           self._delete_elbv2,
-            ResourceType.LB_NLB:           self._delete_elbv2,
-            ResourceType.LB_CLASSIC:       self._delete_elb_classic,
-            # Phase 2
-            ResourceType.LAMBDA_FUNCTION:  self._delete_lambda,
-            ResourceType.ECR_REPO:         self._delete_ecr_repo,
-            ResourceType.DYNAMODB_TABLE:   self._delete_dynamodb_table,
-            ResourceType.ELASTICACHE:      self._delete_elasticache,
-            ResourceType.SQS_QUEUE:        self._delete_sqs_queue,
-            ResourceType.SNS_TOPIC:        self._delete_sns_topic,
-            ResourceType.ROUTE53_ZONE:     self._delete_route53_zone,
-            ResourceType.CLOUDFRONT:       self._delete_cloudfront,
-            # Phase 3
-            ResourceType.FARGATE_TASK:     self._delete_ecs_cluster,
-            ResourceType.AWS_SECRET:       self._delete_secret,
-            ResourceType.CLOUDWATCH_ALARM: self._delete_cloudwatch_alarm,
-        }
-        handler = handlers.get(resource.resource_type)
-        if handler:
-            try:
-                return handler(resource)
-            except Exception as exc:
-                # Catch 404/NotFound errors from boto3
-                exc_str = str(exc).lower()
-                if "notfound" in exc_str or "nosuch" in exc_str or "does not exist" in exc_str:
-                    self._emit(f"[AWS] Resource {resource.resource_id} already deleted.")
-                    return f"Already deleted: {resource.resource_id}"
-                raise exc
+        # Ensure we are in the correct region for this resource
+        old_region = self._region
+        if resource.region and resource.region != old_region:
+            self._region = resource.region
 
-        return f"No deletion handler for {resource.resource_type.value}"
+        try:
+            handlers = {
+                ResourceType.INSTANCE:         self._delete_instance,
+                ResourceType.EBS_VOLUME:       self._delete_ebs,
+                ResourceType.EIP:              self._delete_eip,
+                ResourceType.RDS:              self._delete_rds,
+                ResourceType.INTERNET_GATEWAY: self._delete_igw,
+                ResourceType.NAT_GATEWAY:      self._delete_nat_gw,
+                ResourceType.KUBERNETES:       self._delete_eks,
+                ResourceType.KUBERNETES_NODE_GROUP: self._delete_eks_nodegroup,
+                ResourceType.KUBERNETES_ADDON: self._delete_eks_addon,
+                ResourceType.SUBNET:           self._delete_subnet,
+                ResourceType.ROUTE_TABLE:      self._delete_route_table,
+                ResourceType.SECURITY_GROUP:   self._delete_security_group,
+                ResourceType.VPC:              self._delete_vpc,
+                ResourceType.S3_BUCKET:        self._delete_s3_bucket,
+                ResourceType.LB_ALB:           self._delete_elbv2,
+                ResourceType.LB_NLB:           self._delete_elbv2,
+                ResourceType.LB_CLASSIC:       self._delete_elb_classic,
+                # Phase 2
+                ResourceType.LAMBDA_FUNCTION:  self._delete_lambda,
+                ResourceType.ECR_REPO:         self._delete_ecr_repo,
+                ResourceType.DYNAMODB_TABLE:   self._delete_dynamodb_table,
+                ResourceType.ELASTICACHE:      self._delete_elasticache,
+                ResourceType.SQS_QUEUE:        self._delete_sqs_queue,
+                ResourceType.SNS_TOPIC:        self._delete_sns_topic,
+                ResourceType.ROUTE53_ZONE:     self._delete_route53_zone,
+                ResourceType.CLOUDFRONT:       self._delete_cloudfront,
+                # Phase 3
+                ResourceType.FARGATE_TASK:     self._delete_ecs_cluster,
+                ResourceType.AWS_SECRET:       self._delete_secret,
+                ResourceType.CLOUDWATCH_ALARM: self._delete_cloudwatch_alarm,
+            }
+            handler = handlers.get(resource.resource_type)
+            if handler:
+                return handler(resource)
+            return f"No deletion handler for {resource.resource_type.value}"
+        except Exception as exc:
+            # Catch 404/NotFound errors from boto3
+            exc_str = str(exc).lower()
+            if "notfound" in exc_str or "nosuch" in exc_str or "does not exist" in exc_str:
+                self._emit(f"[AWS] Resource {resource.resource_id} already deleted.")
+                return f"Already deleted: {resource.resource_id}"
+            raise exc
+        finally:
+            self._region = old_region
 
     # ── private scan helpers ──────────────────────────────────────────────────
 
     def _ec2(self, region: Optional[str] = None):
-        return self._session.client("ec2", region_name=region or self._region)
+        return self._session.client("ec2", region_name=region or self._region, config=self._config)
 
     def _rds_client(self):
-        return self._session.client("rds", region_name=self._region)
+        return self._session.client("rds", region_name=self._region, config=self._config)
 
     def _eks_client(self):
-        return self._session.client("eks", region_name=self._region)
+        return self._session.client("eks", region_name=self._region, config=self._config)
 
     def _s3_client(self):
-        return self._session.client("s3", region_name=self._region)
+        # S3 is global, use us-east-1 to avoid regional opt-in issues
+        return self._session.client("s3", region_name="us-east-1", config=self._config)
 
-    def _elb_client(self):
-        """ELBv2 client — ALB + NLB."""
-        return self._session.client("elbv2", region_name=self._region)
+    def _elb_client(self, region: Optional[str] = None):
+        return self._session.client("elb", region_name=region or self._region, config=self._config)
+
+    def _elbv2_client(self, region: Optional[str] = None):
+        return self._session.client("elbv2", region_name=region or self._region, config=self._config)
 
     def _elb_classic_client(self):
-        """Classic ELB client."""
-        return self._session.client("elb", region_name=self._region)
+        return self._elb_client()
 
     def _lambda_client(self):
-        return self._session.client("lambda", region_name=self._region)
+        return self._session.client("lambda", region_name=self._region, config=self._config)
 
     def _ecr_client(self):
-        return self._session.client("ecr", region_name=self._region)
+        return self._session.client("ecr", region_name=self._region, config=self._config)
 
     def _dynamodb_client(self):
-        return self._session.client("dynamodb", region_name=self._region)
+        return self._session.client("dynamodb", region_name=self._region, config=self._config)
 
     def _elasticache_client(self):
-        return self._session.client("elasticache", region_name=self._region)
+        return self._session.client("elasticache", region_name=self._region, config=self._config)
 
     def _sqs_client(self):
-        return self._session.client("sqs", region_name=self._region)
+        return self._session.client("sqs", region_name=self._region, config=self._config)
 
     def _sns_client(self):
-        return self._session.client("sns", region_name=self._region)
+        return self._session.client("sns", region_name=self._region, config=self._config)
 
     def _route53_client(self):
-        return self._session.client("route53")  # Route53 is global
+        # Route53 is global
+        return self._session.client("route53", region_name="us-east-1", config=self._config)
 
     def _cloudfront_client(self):
-        return self._session.client("cloudfront")  # CloudFront is global
+        # CloudFront is global
+        return self._session.client("cloudfront", region_name="us-east-1", config=self._config)
 
     def _ecs_client(self):
-        return self._session.client("ecs", region_name=self._region)
+        return self._session.client("ecs", region_name=self._region, config=self._config)
 
     def _secretsmanager_client(self):
-        return self._session.client("secretsmanager", region_name=self._region)
+        return self._session.client("secretsmanager", region_name=self._region, config=self._config)
 
     def _cloudwatch_client(self):
-        return self._session.client("cloudwatch", region_name=self._region)
+        return self._session.client("cloudwatch", region_name=self._region, config=self._config)
 
     def _make_resource(self, rid, name, rtype, vpc_id=None,
                        status="", metadata=None, layer=1,
-                       estimated_cost=0.0, age_days=-1, tags=None) -> CloudResource:
+                       estimated_cost=0.0, age_days=0, tags=None) -> CloudResource:
         return CloudResource(
             resource_id=rid,
             name=name,
@@ -258,15 +289,6 @@ class AWSManager(CloudProvider):
             age_days=age_days,
         )
 
-    @staticmethod
-    def _age(launch_str: Optional[str]) -> int:
-        if not launch_str:
-            return -1
-        try:
-            dt = datetime.fromisoformat(str(launch_str).replace("Z", "+00:00"))
-            return (datetime.now(timezone.utc) - dt).days
-        except Exception:
-            return -1
 
     @staticmethod
     def _tags_dict(tags_list: list) -> dict:
@@ -324,12 +346,15 @@ class AWSManager(CloudProvider):
                 rid   = inst["InstanceId"]
                 name  = self._name_from_tags(inst.get("Tags", []), rid)
                 state = inst.get("State", {}).get("Name", "")
+                # Estimate cost: ~$0.05/hour for a general purpose instance ≈ $36/month
+                cost = 36.0 if state == "running" else 0.0
                 resources.append(self._make_resource(
                     rid, name, ResourceType.INSTANCE,
                     vpc_id=inst.get("VpcId"),
                     status=state,
                     metadata=inst, layer=1,
-                    age_days=self._age(inst.get("LaunchTime")),
+                    age_days=self._get_age(inst),
+                    estimated_cost=cost,
                     tags=self._tags_dict(inst.get("Tags", [])),
                 ))
         return resources
@@ -357,7 +382,7 @@ class AWSManager(CloudProvider):
                 status=vol.get("State", ""),
                 metadata=vol, layer=2,
                 estimated_cost=cost,
-                age_days=self._age(vol.get("CreateTime")),
+                age_days=self._get_age(vol),
                 tags=self._tags_dict(vol.get("Tags", [])),
             ))
             # Add dependencies
@@ -413,11 +438,14 @@ class AWSManager(CloudProvider):
         for page in paginator.paginate():
             for db in page["DBInstances"]:
                 rid  = db["DBInstanceIdentifier"]
+                # RDS instance cost estimate (db.t3.medium class ≈ $0.10/hour ≈ $72/month)
+                cost = 72.0 if db.get("DBInstanceStatus") == "available" else 0.0
                 resources.append(self._make_resource(
                     rid, rid, ResourceType.RDS,
                     status=db.get("DBInstanceStatus", ""),
                     metadata=db, layer=1,
-                    age_days=self._age(db.get("InstanceCreateTime")),
+                    age_days=self._get_age(db),
+                    estimated_cost=cost,
                 ))
         return resources
 
@@ -482,9 +510,13 @@ class AWSManager(CloudProvider):
     # ── EKS ───────────────────────────────────────────────────────────────────
 
     def _scan_eks(self) -> list[CloudResource]:
-        eks = self._eks_client()
+        from botocore.config import Config
         resources = []
         try:
+            # EKS can be slow to respond, give it more time than other services
+            eks_config = Config(connect_timeout=15, read_timeout=20, retries={'max_attempts': 1})
+            eks = self._session.client("eks", region_name=self._region, config=eks_config)
+            
             resp = eks.list_clusters()
             for name in resp.get("clusters", []):
                 cluster = eks.describe_cluster(name=name)["cluster"]
@@ -525,7 +557,7 @@ class AWSManager(CloudProvider):
                     self._emit(f"[AWS] Warning scanning EKS Addons for {name}: {e}")
 
         except Exception as exc:
-            self._emit(f"[AWS] Error scanning EKS: {exc}")
+            raise exc
         return resources
 
     # ── Security Groups ───────────────────────────────────────────────────────
@@ -586,7 +618,7 @@ class AWSManager(CloudProvider):
                     tags=tags,
                 ))
         except Exception as exc:
-            self._emit(f"[AWS] Error scanning S3 buckets: {exc}")
+            raise exc
         return resources
 
     def _get_s3_bucket_size_cost(self, s3_client, bucket_name: str) -> tuple[float, float]:
@@ -669,7 +701,7 @@ class AWSManager(CloudProvider):
                         tags=tags,
                     ))
         except Exception as exc:
-            self._emit(f"[AWS] Error scanning ELBv2: {exc}")
+            raise exc
         return resources
 
     def _scan_elb_classic(self) -> list[CloudResource]:
@@ -690,7 +722,7 @@ class AWSManager(CloudProvider):
                         estimated_cost=18.0,  # Classic LB ~$18/month
                     ))
         except Exception as exc:
-            self._emit(f"[AWS] Error scanning Classic ELB: {exc}")
+            raise exc
         return resources
 
     # ── deletion helpers ──────────────────────────────────────────────────────
@@ -850,7 +882,7 @@ class AWSManager(CloudProvider):
                         age_days=self._age(fn.get("LastModified")),
                     ))
         except Exception as exc:
-            self._emit(f"[AWS] Error scanning Lambda: {exc}")
+            raise exc
         return resources
 
     def _delete_lambda(self, resource: CloudResource) -> str:
@@ -871,10 +903,10 @@ class AWSManager(CloudProvider):
                         repo["repositoryArn"], name, ResourceType.ECR_REPO,
                         status="active",
                         metadata=repo, layer=1,
-                        age_days=self._age(str(repo.get("createdAt", ""))),
+                        age_days=self._get_age(repo),
                     ))
         except Exception as exc:
-            self._emit(f"[AWS] Error scanning ECR: {exc}")
+            raise exc
         return resources
 
     def _delete_ecr_repo(self, resource: CloudResource) -> str:
@@ -905,12 +937,12 @@ class AWSManager(CloudProvider):
                             status=desc.get("TableStatus", ""),
                             metadata=desc, layer=1,
                             estimated_cost=cost,
-                            age_days=self._age(str(desc.get("CreationDateTime", ""))),
+                            age_days=self._get_age(desc),
                         ))
                     except Exception:
                         pass
         except Exception as exc:
-            self._emit(f"[AWS] Error scanning DynamoDB: {exc}")
+            raise exc
         return resources
 
     def _delete_dynamodb_table(self, resource: CloudResource) -> str:
@@ -935,10 +967,10 @@ class AWSManager(CloudProvider):
                         status=cluster.get("CacheClusterStatus", ""),
                         metadata=cluster, layer=1,
                         estimated_cost=cost,
-                        age_days=self._age(str(cluster.get("CacheClusterCreateTime", ""))),
+                        age_days=self._get_age(cluster),
                     ))
         except Exception as exc:
-            self._emit(f"[AWS] Error scanning ElastiCache: {exc}")
+            raise exc
         return resources
 
     def _delete_elasticache(self, resource: CloudResource) -> str:
@@ -964,7 +996,7 @@ class AWSManager(CloudProvider):
                         estimated_cost=0.0,  # SQS is pay-per-use
                     ))
         except Exception as exc:
-            self._emit(f"[AWS] Error scanning SQS: {exc}")
+            raise exc
         return resources
 
     def _delete_sqs_queue(self, resource: CloudResource) -> str:
@@ -989,7 +1021,7 @@ class AWSManager(CloudProvider):
                         estimated_cost=0.0,  # SNS is pay-per-use
                     ))
         except Exception as exc:
-            self._emit(f"[AWS] Error scanning SNS: {exc}")
+            raise exc
         return resources
 
     def _delete_sns_topic(self, resource: CloudResource) -> str:
@@ -1015,7 +1047,7 @@ class AWSManager(CloudProvider):
                         estimated_cost=0.50,
                     ))
         except Exception as exc:
-            self._emit(f"[AWS] Error scanning Route53: {exc}")
+            raise exc
         return resources
 
     def _delete_route53_zone(self, resource: CloudResource) -> str:
@@ -1060,7 +1092,7 @@ class AWSManager(CloudProvider):
                         estimated_cost=1.0,
                     ))
         except Exception as exc:
-            self._emit(f"[AWS] Error scanning CloudFront: {exc}")
+            raise exc
         return resources
 
     def _delete_cloudfront(self, resource: CloudResource) -> str:
@@ -1103,7 +1135,7 @@ class AWSManager(CloudProvider):
                             estimated_cost=0.0,
                         ))
         except Exception as exc:
-            self._emit(f"[AWS] Error scanning ECS Clusters: {exc}")
+            raise exc
         return resources
 
     def _delete_ecs_cluster(self, resource: CloudResource) -> str:
@@ -1149,7 +1181,7 @@ class AWSManager(CloudProvider):
                         estimated_cost=0.40,
                     ))
         except Exception as exc:
-            self._emit(f"[AWS] Error scanning Secrets Manager: {exc}")
+            raise exc
         return resources
 
     def _delete_secret(self, resource: CloudResource) -> str:
@@ -1178,7 +1210,7 @@ class AWSManager(CloudProvider):
                         estimated_cost=0.10,
                     ))
         except Exception as exc:
-            self._emit(f"[AWS] Error scanning CloudWatch Alarms: {exc}")
+            raise exc
         return resources
 
     def _delete_cloudwatch_alarm(self, resource: CloudResource) -> str:

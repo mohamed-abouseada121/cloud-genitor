@@ -19,15 +19,39 @@ from typing import Any, Optional
 
 from models.resource import CloudResource, ProviderName, ResourceType
 from providers.base_provider import CloudProvider
-from utils.credentials import AlibabaCredentials
+from utils.credentials import AlibabaCredentials, CredentialManager
 from utils.pagination import alibaba_paginate
+
+# SDK Imports (Global for speed)
+try:
+    from alibabacloud_ecs20140526.client import Client as EcsClient
+    from alibabacloud_ecs20140526 import models as ecs_models
+    from alibabacloud_vpc20160428.client import Client as VpcClient
+    from alibabacloud_vpc20160428 import models as vpc_models
+    from alibabacloud_rds20140815.client import Client as RdsClient
+    from alibabacloud_rds20140815 import models as rds_models
+    from alibabacloud_cs20151215.client import Client as CsClient
+    from alibabacloud_cs20151215 import models as cs_models
+    from alibabacloud_slb20140515.client import Client as SlbClient
+    from alibabacloud_slb20140515 import models as slb_models
+    from alibabacloud_fc_open20210406.client import Client as FcClient
+    from alibabacloud_fc_open20210406 import models as fc_models
+    from alibabacloud_cr20181201.client import Client as CrClient
+    from alibabacloud_cr20181201 import models as cr_models
+    from alibabacloud_mns_open20220119.client import Client as MnsClient
+    from alibabacloud_mns_open20220119 import models as mns_models
+    from alibabacloud_alidns20150109.client import Client as DnsClient
+    from alibabacloud_alidns20150109 import models as dns_models
+    import oss2
+except ImportError:
+    pass
 
 log = logging.getLogger(__name__)
 
 # Regions known to require conservative rate-limiting
 _SENSITIVE_REGIONS = {"me-central-1", "me-east-1"}
-_DEFAULT_RPS       = 10.0
-_SENSITIVE_RPS     = 5.0
+_DEFAULT_RPS       = 50.0
+_SENSITIVE_RPS     = 50.0
 _MAX_RETRY         = 5
 _BACKOFF_BASE      = 2.0    # seconds
 _BACKOFF_MAX       = 30.0   # seconds
@@ -95,59 +119,42 @@ class AlibabaManager(CloudProvider):
 
     # ── connection ────────────────────────────────────────────────────────────
 
-    def connect(self, credentials: AlibabaCredentials) -> bool:
+    def connect(self, credentials: AlibabaCredentials, test_connection: bool = True) -> bool:
         try:
-            from alibabacloud_ecs20140526.client import Client as EcsClient    # type: ignore
-            from alibabacloud_vpc20160428.client import Client as VpcClient    # type: ignore
-            from utils.credentials import CredentialManager
-
             self._region = credentials.region_id
             cfg          = CredentialManager().get_alibaba_config(credentials)
 
             self._ecs_client = EcsClient(cfg)
             self._vpc_client = VpcClient(cfg)
-
-            from alibabacloud_rds20140815.client import Client as RdsClient  # type: ignore
-            from alibabacloud_cs20151215.client import Client as CsClient    # type: ignore
             self._rds_client = RdsClient(cfg)
             self._cs_client  = CsClient(cfg)
 
             # SLB Client
             try:
-                from alibabacloud_slb20140515.client import Client as SlbClient  # type: ignore
                 self._slb_client = SlbClient(cfg)
-            except ImportError:
+            except NameError:
                 self._emit("[Alibaba] SLB SDK not installed — skipping SLB scan")
 
             # OSS Client
             try:
-                import oss2  # type: ignore
-                auth = oss2.Auth(
+                self._oss_auth = oss2.Auth(
                     credentials.access_key_id,
                     credentials.access_key_secret,
                 )
                 endpoint = f"https://oss-{self._region}.aliyuncs.com"
-                self._oss_client = oss2.Service(auth, endpoint)
-            except ImportError:
+                self._oss_client = oss2.Service(self._oss_auth, endpoint)
+            except (NameError, ImportError):
                 self._emit("[Alibaba] oss2 SDK not installed — skipping OSS scan")
 
             # Phase 3 clients
-            try:
-                from alibabacloud_fc_open20210406.client import Client as FcClient  # type: ignore
-                self._fc_client = FcClient(cfg)
-            except ImportError: pass
-            try:
-                from alibabacloud_cr20181201.client import Client as CrClient  # type: ignore
-                self._cr_client = CrClient(cfg)
-            except ImportError: pass
-            try:
-                from alibabacloud_mns_open20220119.client import Client as MnsClient  # type: ignore
-                self._mns_client = MnsClient(cfg)
-            except ImportError: pass
-            try:
-                from alibabacloud_alidns20150109.client import Client as DnsClient  # type: ignore
-                self._dns_client = DnsClient(cfg)
-            except ImportError: pass
+            try: self._fc_client = FcClient(cfg)
+            except NameError: pass
+            try: self._cr_client = CrClient(cfg)
+            except NameError: pass
+            try: self._mns_client = MnsClient(cfg)
+            except NameError: pass
+            try: self._dns_client = DnsClient(cfg)
+            except NameError: pass
 
             rps = _SENSITIVE_RPS if self._region in _SENSITIVE_REGIONS else _DEFAULT_RPS
             self._limiter = _RateLimiter(rps)
@@ -205,23 +212,26 @@ class AlibabaManager(CloudProvider):
 
     def scan_hierarchical(self, region: str) -> list[CloudResource]:
         self._region = region
+        from concurrent.futures import ThreadPoolExecutor
+        tasks = [
+            self._scan_vpcs, self._scan_vswitches, self._scan_instances,
+            self._scan_disks, self._scan_eips, self._scan_security_groups,
+            self._scan_nat_gateways, self._scan_rds_instances, self._scan_ack_clusters,
+            self._scan_oss_buckets, self._scan_slb_load_balancers,
+            self._scan_fc_functions, self._scan_acr_repos, self._scan_mns_topics,
+            self._scan_dns_zones
+        ]
+        
         resources: list[CloudResource] = []
-        resources.extend(self._scan_vpcs())
-        resources.extend(self._scan_vswitches())
-        resources.extend(self._scan_instances())
-        resources.extend(self._scan_disks())
-        resources.extend(self._scan_eips())
-        resources.extend(self._scan_security_groups())
-        resources.extend(self._scan_nat_gateways())
-        resources.extend(self._scan_rds_instances())
-        resources.extend(self._scan_ack_clusters())
-        resources.extend(self._scan_oss_buckets())
-        resources.extend(self._scan_slb_load_balancers())
-        # Phase 3
-        resources.extend(self._scan_fc_functions())
-        resources.extend(self._scan_acr_repos())
-        resources.extend(self._scan_mns_topics())
-        resources.extend(self._scan_dns_zones())
+        with ThreadPoolExecutor(max_workers=20) as executor:
+            futures = [executor.submit(t) for t in tasks]
+            for f in futures:
+                try:
+                    res = f.result()
+                    if res: resources.extend(res)
+                except Exception as e:
+                    self._emit(f"[Alibaba] Internal scan error in {region}: {e}")
+                    
         self._emit(f"[Alibaba] Hierarchical scan done — {len(resources)} resources in {region}")
         return resources
 
@@ -291,12 +301,16 @@ class AlibabaManager(CloudProvider):
 
     def _delete_security_group(self, r: CloudResource) -> str:
         from alibabacloud_ecs20140526 import models as ecs_models  # type: ignore
-        self._call(self._ecs_client.delete_security_group, ecs_models.DeleteSecurityGroupRequest(security_group_id=r.resource_id))
+        self._call(self._ecs_client.delete_security_group, ecs_models.DeleteSecurityGroupRequest(
+            region_id=self._region, security_group_id=r.resource_id
+        ))
         return f"Deleted Security Group {r.resource_id}"
 
     def _delete_vpc(self, r: CloudResource) -> str:
         from alibabacloud_vpc20160428 import models as vpc_models  # type: ignore
-        self._call(self._vpc_client.delete_vpc, vpc_models.DeleteVpcRequest(vpc_id=r.resource_id))
+        self._call(self._vpc_client.delete_vpc, vpc_models.DeleteVpcRequest(
+            region_id=self._region, vpc_id=r.resource_id
+        ))
         return f"Deleted VPC {r.resource_id}"
 
     def _delete_nat_gateway(self, r: CloudResource) -> str:
@@ -319,7 +333,7 @@ class AlibabaManager(CloudProvider):
         return f"Initiated ACK Node Pool deletion {r.resource_id}"
 
     def _delete_oss_bucket_wrapper(self, r: CloudResource) -> str:
-        return self._delete_oss_bucket(r.resource_id)
+        return self._delete_oss_bucket(r)
 
     def _delete_slb(self, r: CloudResource) -> str:
         from alibabacloud_slb20140515 import models as slb_models  # type: ignore
@@ -333,7 +347,7 @@ class AlibabaManager(CloudProvider):
     def _delete_acr_repo(self, r: CloudResource) -> str:
         from alibabacloud_cr20181201 import models as cr_models  # type: ignore
         ns = r.metadata.get("namespace", "")
-        self._call(self._cr_client.delete_repo, cr_models.DeleteRepoRequest(instance_id=r.parent_id, repo_namespace_name=ns, repo_name=r.resource_id))
+        self._call(self._cr_client.delete_repository, cr_models.DeleteRepositoryRequest(instance_id=r.parent_id, repo_namespace_name=ns, repo_name=r.resource_id))
         return f"Deleted ACR Repo {r.resource_id}"
 
     def _delete_mns_topic(self, r: CloudResource) -> str:
@@ -350,7 +364,7 @@ class AlibabaManager(CloudProvider):
 
     def _make_resource(self, rid, name, rtype, parent_id=None,
                        status="", metadata=None, layer=1,
-                       estimated_cost=0.0, tags=None, age_days=-1) -> CloudResource:
+                       estimated_cost=0.0, tags=None, age_days=0) -> CloudResource:
         return CloudResource(
             resource_id=rid, name=name, resource_type=rtype,
             provider=ProviderName.ALIBABA, region=self._region,
@@ -377,6 +391,7 @@ class AlibabaManager(CloudProvider):
                 vpc.vpc_id, vpc.vpc_name or vpc.vpc_id,
                 ResourceType.VPC, status=vpc.status,
                 metadata={"cidr": vpc.cidr_block}, layer=5,
+                age_days=self._get_age(vpc),
             ))
         return resources
 
@@ -398,6 +413,7 @@ class AlibabaManager(CloudProvider):
                 sw.v_switch_id, sw.v_switch_name or sw.v_switch_id,
                 ResourceType.SUBNET, parent_id=sw.vpc_id,
                 status=sw.status, layer=4,
+                age_days=self._get_age(sw),
             ))
         return resources
 
@@ -421,6 +437,8 @@ class AlibabaManager(CloudProvider):
                 ResourceType.INSTANCE,
                 parent_id=inst.vpc_attributes.vpc_id if inst.vpc_attributes else None,
                 status=inst.status, layer=1,
+                estimated_cost=36.0 if inst.status == "Running" else 0.0,
+                age_days=self._get_age(inst),
             ))
         return resources
 
@@ -443,6 +461,7 @@ class AlibabaManager(CloudProvider):
                 disk.disk_id, disk.disk_name or disk.disk_id,
                 ResourceType.DISK, status=disk.status,
                 layer=2, estimated_cost=cost,
+                age_days=self._age(disk.creation_time),
             ))
         return resources
 
@@ -467,6 +486,7 @@ class AlibabaManager(CloudProvider):
                 disk.disk_id, disk.disk_name or disk.disk_id,
                 ResourceType.DISK, status="unattached",
                 layer=2, estimated_cost=cost,
+                age_days=self._get_age(disk),
             ))
         return resources
 
@@ -539,7 +559,8 @@ class AlibabaManager(CloudProvider):
         def builder(page, size):
             return rds_models.DescribeDBInstancesRequest(region_id=self._region, page_number=page, page_size=size)
         def extractor(resp): return resp.body.items.dbinstance
-        def total(resp):    return resp.body.total_count
+        def total(resp):
+            return getattr(resp.body, "total_count", getattr(resp.body, "TotalCount", 0))
 
         resources = []
         try:
@@ -547,6 +568,8 @@ class AlibabaManager(CloudProvider):
                 resources.append(self._make_resource(
                     db.dbinstance_id, db.dbinstance_description or db.dbinstance_id, ResourceType.CLOUD_SQL,
                     parent_id=db.vpc_id, status=db.dbinstance_status, layer=1,
+                    estimated_cost=73.0,
+                    age_days=self._get_age(db),
                 ))
         except Exception as exc:
             self._emit(f"[Alibaba] Error scanning RDS: {exc}")
@@ -555,11 +578,15 @@ class AlibabaManager(CloudProvider):
     def _scan_ack_clusters(self) -> list[CloudResource]:
         resources = []
         try:
-            resp = self._call(self._cs_client.describe_clusters_v1)
-            for cluster in resp.body:
+            from alibabacloud_cs20151215 import models as cs_models # type: ignore
+            req = cs_models.DescribeClustersV1Request()
+            resp = self._call(self._cs_client.describe_clusters_v1, req)
+            for cluster in resp.body.clusters:
                 resources.append(self._make_resource(
                     cluster.cluster_id, cluster.name, ResourceType.KUBERNETES,
                     parent_id=cluster.vpc_id, status=cluster.state, layer=2,
+                    estimated_cost=72.0,  # Standard Edition base cost
+                    age_days=self._get_age(cluster),
                 ))
                 
                 # Scan Node Pools
@@ -588,35 +615,42 @@ class AlibabaManager(CloudProvider):
         try:
             import oss2  # type: ignore
             for bucket_info in oss2.BucketIterator(self._oss_client):
+                # Filter buckets by the current scanning region to avoid duplicates
+                if bucket_info.location != f"oss-{self._region}":
+                    continue
                 resources.append(self._make_resource(
                     bucket_info.name, bucket_info.name, ResourceType.OSS_BUCKET,
-                    status=self._region,
+                    status=bucket_info.location,
                     metadata={
-                        "location":       self._region,
+                        "location":       bucket_info.location,
                         "creation_date":  bucket_info.creation_date,
                     },
                     layer=1,
-                    estimated_cost=0.0,  # Size requires listing objects
+                    estimated_cost=1.0,
+                    age_days=self._age(bucket_info.creation_date),
                 ))
         except Exception as exc:
             self._emit(f"[Alibaba] Error scanning OSS buckets: {exc}")
         return resources
 
-    def _delete_oss_bucket(self, bucket_name: str) -> str:
+    def _delete_oss_bucket(self, resource: CloudResource) -> str:
         """Delete an OSS bucket — empties all objects first."""
+        bucket_name = resource.resource_id
+        # status stores the location (e.g. oss-cn-hangzhou)
+        location = resource.status if resource.status.startswith("oss-") else f"oss-{self._region}"
         try:
             import oss2  # type: ignore
-            # Re-create a per-bucket client using the bucket name
-            auth     = self._oss_client._auth  # reuse existing auth
-            endpoint = f"https://oss-{self._region}.aliyuncs.com"
+            auth     = self._oss_auth
+            endpoint = f"https://{location}.aliyuncs.com"
             bucket   = oss2.Bucket(auth, endpoint, bucket_name)
 
             self._emit(f"[Alibaba] Emptying OSS bucket {bucket_name}…")
             # Delete all objects in batches
             for obj in oss2.ObjectIterator(bucket):
+                self._emit(f"Deleting object: {obj.key}")
                 bucket.delete_object(obj.key)
 
-            bucket.delete()
+            bucket.delete_bucket()
             return f"Deleted OSS bucket {bucket_name}"
         except Exception as exc:
             raise Exception(f"Failed to delete OSS bucket {bucket_name}: {exc}")
@@ -650,7 +684,8 @@ class AlibabaManager(CloudProvider):
                     parent_id=lb.vpc_id,
                     status=lb.load_balancer_status,
                     layer=1,
-                    estimated_cost=14.0,  # Alibaba SLB ~$14/month
+                    estimated_cost=14.0,
+                    age_days=self._get_age(lb),
                 ))
         except Exception as exc:
             self._emit(f"[Alibaba] Error scanning SLB: {exc}")
@@ -692,7 +727,8 @@ class AlibabaManager(CloudProvider):
                         fn.function_name, fn.function_name, ResourceType.ALIBABA_FUNCTION,
                         parent_id=svc_name, status="active",
                         metadata={"service": svc_name, "runtime": fn.runtime},
-                        layer=1, estimated_cost=0.0,
+                        layer=1, estimated_cost=0.10,
+                        age_days=self._get_age(fn),
                     ))
         except Exception as exc:
             self._emit(f"[Alibaba] Error scanning Function Compute: {exc}")
@@ -705,23 +741,42 @@ class AlibabaManager(CloudProvider):
         if not self._cr_client: return []
         try:
             from alibabacloud_cr20181201 import models as cr_models  # type: ignore
-            
-            def builder(page, size):
-                return cr_models.ListRepoRequest(page_no=page, page_size=size)
-            def extractor(resp): return resp.body.repos
-            def total(resp):    return resp.body.total_count
-
             from utils.pagination import alibaba_paginate
-            for repo in alibaba_paginate(
-                lambda r: self._call(self._cr_client.list_repo, r),
-                builder, extractor, total,
-            ):
-                resources.append(self._make_resource(
-                    repo.repo_name, repo.repo_name, ResourceType.ALIBABA_CR,
-                    parent_id=repo.instance_id, status=repo.repo_status,
-                    metadata={"namespace": repo.repo_namespace_name, "type": repo.repo_type},
-                    layer=1, estimated_cost=0.0,
-                ))
+            
+            # Step 1: List ACR Instances to get InstanceIds
+            def inst_builder(page, size):
+                return cr_models.ListInstanceRequest(page_no=page, page_size=size)
+            def inst_extractor(resp): return resp.body.instances
+            def inst_total(resp):    return resp.body.total_count
+
+            instances = []
+            try:
+                instances = alibaba_paginate(
+                    lambda r: self._call(self._cr_client.list_instance, r),
+                    inst_builder, inst_extractor, inst_total
+                )
+            except Exception:
+                return []
+
+            # Step 2: For each instance, list its repositories
+            for inst in instances:
+                inst_id = inst.instance_id
+                def repo_builder(page, size):
+                    return cr_models.ListRepositoryRequest(instance_id=inst_id, page_no=page, page_size=size)
+                def repo_extractor(resp): return resp.body.repositories
+                def repo_total(resp):    return resp.body.total_count
+
+                for repo in alibaba_paginate(
+                    lambda r: self._call(self._cr_client.list_repository, r),
+                    repo_builder, repo_extractor, repo_total,
+                ):
+                    resources.append(self._make_resource(
+                        repo.repo_name, repo.repo_name, ResourceType.ALIBABA_CR,
+                        parent_id=inst_id, status=repo.repo_status,
+                        metadata={"namespace": repo.repo_namespace_name, "type": repo.repo_type, "instance": inst_id},
+                        layer=1, estimated_cost=1.0,
+                        age_days=self._get_age(repo),
+                    ))
         except Exception as exc:
             self._emit(f"[Alibaba] Error scanning ACR: {exc}")
         return resources
@@ -739,6 +794,7 @@ class AlibabaManager(CloudProvider):
                     topic.topic_name, topic.topic_name, ResourceType.ALIBABA_MNS,
                     status="active",
                     metadata={}, layer=1, estimated_cost=0.0,
+                    age_days=self._get_age(topic),
                 ))
         except Exception as exc:
             self._emit(f"[Alibaba] Error scanning MNS: {exc}")
@@ -767,6 +823,7 @@ class AlibabaManager(CloudProvider):
                     status="active",
                     metadata={"domain_id": domain.domain_id}, layer=1,
                     estimated_cost=0.0,
+                    age_days=self._get_age(domain),
                 ))
         except Exception as exc:
             self._emit(f"[Alibaba] Error scanning Alibaba DNS: {exc}")

@@ -14,13 +14,35 @@ Deletion order (inside-out):
 from __future__ import annotations
 
 import logging
+import threading
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Optional, Dict
 
 from models.resource import CloudResource, ProviderName, ResourceType
 from providers.base_provider import CloudProvider
-from utils.credentials import AzureCredentials
+from utils.credentials import AzureCredentials, CredentialManager
 from utils.pagination import azure_paginate
+
+# Azure SDK Imports
+try:
+    from azure.mgmt.compute import ComputeManagementClient
+    from azure.mgmt.network import NetworkManagementClient
+    from azure.mgmt.resource import ResourceManagementClient
+    from azure.mgmt.sql import SqlManagementClient
+    from azure.mgmt.storage import StorageManagementClient
+    from azure.mgmt.containerservice import ContainerServiceClient
+    from azure.mgmt.cosmosdb import CosmosDBManagementClient
+    from azure.mgmt.redis import RedisManagementClient
+    from azure.mgmt.servicebus import ServiceBusManagementClient
+    from azure.mgmt.dns import DnsManagementClient
+    from azure.mgmt.cdn import CdnManagementClient
+    from azure.mgmt.web import WebSiteManagementClient
+    from azure.mgmt.containerregistry import ContainerRegistryManagementClient
+    from azure.mgmt.containerinstance import ContainerInstanceManagementClient
+    from azure.mgmt.keyvault import KeyVaultManagementClient
+    from azure.mgmt.monitor import MonitorManagementClient
+except ImportError:
+    pass
 
 log = logging.getLogger(__name__)
 
@@ -44,9 +66,12 @@ class AzureManager(CloudProvider):
         ResourceType.CONTAINER_INSTANCE, ResourceType.KEY_VAULT, ResourceType.AZURE_MONITOR_ALERT,
     ]
 
+    _scan_lock = threading.Lock()
+    _cached_resources: list[CloudResource] | None = None
+    _cache_time = 0.0
+
     def __init__(self, log_callback=None) -> None:
         super().__init__(log_callback)
-        import threading
         self._credential: Any    = None
         self._subscription_id: str = ""
         self._compute_client: Any  = None
@@ -59,9 +84,6 @@ class AzureManager(CloudProvider):
         self._redis_client: Any    = None
         self._servicebus_client: Any = None
         self._dns_client: Any      = None
-        self._scan_lock            = threading.Lock()
-        self._cached_resources: list[CloudResource] | None = None
-        self._cache_time           = 0.0
         self._cdn_client: Any      = None
         self._web_client: Any      = None
         self._acr_client: Any      = None
@@ -76,7 +98,7 @@ class AzureManager(CloudProvider):
 
     # ── connection ────────────────────────────────────────────────────────────
 
-    def connect(self, credentials: AzureCredentials) -> bool:
+    def connect(self, credentials: AzureCredentials, test_connection: bool = True) -> bool:
         try:
             from utils.credentials import CredentialManager
             from azure.mgmt.compute import ComputeManagementClient                  # type: ignore
@@ -176,9 +198,9 @@ class AzureManager(CloudProvider):
         if not self._resource_client:
             return []
         import time
-        with self._scan_lock:
+        with AzureManager._scan_lock:
             # Cache the entire subscription scan for 60 seconds
-            if self._cached_resources is None or (time.time() - self._cache_time > 60.0):
+            if AzureManager._cached_resources is None or (time.time() - AzureManager._cache_time > 60.0):
                 self._emit("[Azure] Fetching global subscription resources to cache...")
                 resources: list[CloudResource] = []
                 rgs = self._scan_resource_groups()
@@ -222,16 +244,17 @@ class AzureManager(CloudProvider):
                         except Exception as e:
                             self._emit(f"[Azure] Error scanning resource group: {e}")
                             
-                self._cached_resources = resources
-                self._cache_time = time.time()
+                AzureManager._cached_resources = resources
+                AzureManager._cache_time = time.time()
                 self._emit(f"[Azure] Cached {len(resources)} global resources.")
 
         # Filter the cached resources by the requested region and ensure uniqueness
         unique_map = {}
-        for r in self._cached_resources:
-            if r.metadata.get("location") == region:
-                if r.resource_id not in unique_map:
-                    unique_map[r.resource_id] = r
+        if AzureManager._cached_resources:
+            for r in AzureManager._cached_resources:
+                if r.metadata.get("location") == region:
+                    if r.resource_id not in unique_map:
+                        unique_map[r.resource_id] = r
         
         filtered = list(unique_map.values())
         self._emit(f"[Azure] Returned {len(filtered)} resources for region '{region}' from cache.")
@@ -288,14 +311,15 @@ class AzureManager(CloudProvider):
 
     def _make_resource(self, rid, name, rtype, rg_id=None,
                        status="", metadata=None, layer=1,
-                       estimated_cost=0.0, tags=None) -> CloudResource:
+                       estimated_cost=0.0, age_days=0, tags=None) -> CloudResource:
         meta = metadata or {}
         meta["resource_group"] = rg_id or ""
         return CloudResource(
             resource_id=rid, name=name, resource_type=rtype,
-            provider=ProviderName.AZURE, region="",
+            provider=ProviderName.AZURE, region=meta.get("location", ""),
             parent_id=rg_id, deletion_layer=layer,
             status=status, estimated_cost=estimated_cost,
+            age_days=age_days,
             metadata=meta, tags=tags or {},
         )
 
@@ -340,9 +364,12 @@ class AzureManager(CloudProvider):
         for vm in azure_paginate(self._compute_client.virtual_machines.list(rg)):
             resources.append(self._make_resource(
                 vm.name, vm.name, ResourceType.INSTANCE,
-                rg_id=rg, status="",
-                metadata={"resource_group": rg, "location": vm.location},
-                layer=1, tags=vm.tags or {},
+                rg_id=rg, status=vm.provisioning_state or "Running",
+                metadata={"resource_group": rg, "location": vm.location, "vm_size": vm.hardware_profile.vm_size if vm.hardware_profile else ""},
+                layer=1,
+                estimated_cost=45.0, # Average B2s/D2s VM cost
+                age_days=self._get_age(vm),
+                tags=vm.tags or {},
             ))
         return resources
 
@@ -363,8 +390,10 @@ class AzureManager(CloudProvider):
                 disk.name, disk.name, ResourceType.DISK,
                 rg_id=rg,
                 status="attached" if attached else "unattached",
-                metadata={"resource_group": rg, "managed_by": disk.managed_by},
-                layer=2, estimated_cost=cost if not attached else 0.0,
+                metadata={"resource_group": rg, "managed_by": disk.managed_by, "location": disk.location},
+                layer=2, 
+                estimated_cost=cost if not attached else 0.0,
+                age_days=self._get_age(disk),
                 tags=disk.tags or {},
             ))
             resources[-1].dependencies = deps
@@ -393,8 +422,10 @@ class AzureManager(CloudProvider):
             resources.append(self._make_resource(
                 ip.name, ip.name, ResourceType.PUBLIC_IP,
                 rg_id=rg, status="free" if free else "associated",
-                metadata={"resource_group": rg, "address": ip.ip_address},
-                layer=2, estimated_cost=3.65 if free else 0.0,
+                metadata={"resource_group": rg, "address": ip.ip_address, "location": ip.location},
+                layer=2, 
+                estimated_cost=3.65 if free else 0.0,
+                age_days=self._get_age(ip),
                 tags=ip.tags or {},
             ))
         return resources
@@ -464,7 +495,9 @@ class AzureManager(CloudProvider):
                     cluster.name, cluster.name, ResourceType.KUBERNETES,
                     rg_id=rg, status=cluster.provisioning_state,
                     metadata={"resource_group": rg, "location": cluster.location},
-                    layer=2, tags=cluster.tags or {},
+                    layer=2, estimated_cost=73.0,
+                    age_days=self._get_age(cluster),
+                    tags=cluster.tags or {},
                 ))
                 
                 # Scan Agent Pools (Node Groups)
@@ -523,6 +556,7 @@ class AzureManager(CloudProvider):
                     },
                     layer=2,
                     estimated_cost=cost,
+                    age_days=self._get_age(acct),
                     tags=acct.tags or {},
                 ))
         except Exception as exc:

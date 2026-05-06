@@ -12,6 +12,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from providers.base_provider import CloudProvider
 from workers.base_worker import BaseWorker
+from models.resource import CloudResource
+import json
 
 
 class ScanWorker(BaseWorker):
@@ -28,12 +30,13 @@ class ScanWorker(BaseWorker):
 
     def __init__(self, provider_factory: Callable[[], CloudProvider],
                  provider_name: str, regions: list[str], mode: str,
-                 parent: Any = None) -> None:
+                 state_manager: Any = None, parent: Any = None) -> None:
         super().__init__(parent)
         self._provider_factory = provider_factory
         self._provider_name    = provider_name
         self._regions          = regions
         self._mode             = mode
+        self._state_manager    = state_manager
 
     def run(self) -> None:
         try:
@@ -49,8 +52,8 @@ class ScanWorker(BaseWorker):
                 completed = 1
                 self.progress.emit(100)
             else:
-                # Multi-region: parallelize with ThreadPoolExecutor
-                with ThreadPoolExecutor(max_workers=5) as executor:
+                # Multi-region: parallelize with ThreadPoolExecutor (max 20 for high speed)
+                with ThreadPoolExecutor(max_workers=20) as executor:
                     futures = {
                         executor.submit(self._scan_region, region, None): region
                         for region in self._regions
@@ -89,10 +92,25 @@ class ScanWorker(BaseWorker):
         resources = []
         try:
             provider = self._provider_factory()
+            # Fast-path: Skip redundant connectivity checks inside parallel regions
+            creds = getattr(provider, "_last_credentials", None) 
+            # Note: connect() is already called by _factory in MainWindow,
+            # but we can ensure it's fast if called again.
+            # Actually, MainWindow's factory calls connect(creds) WITHOUT test_connection=False.
+            # I should update MainWindow as well.
+            # For AWS, only scan global services once (in the first region of the list)
+            scan_global = False
+            if self._provider_name == "AWS" and self._regions and region == self._regions[0]:
+                scan_global = True
+
             if self._mode == "comprehensive":
                 resources = provider.scan_comprehensive(region)
             else:
-                resources = provider.scan_hierarchical(region)
+                # Use scan_global if provider is AWS
+                if self._provider_name == "AWS":
+                    resources = provider.scan_hierarchical(region, scan_global=scan_global)
+                else:
+                    resources = provider.scan_hierarchical(region)
 
             for r in resources:
                 self.resource_found.emit(r)

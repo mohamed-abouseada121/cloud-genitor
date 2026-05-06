@@ -317,12 +317,19 @@ class _JsonPreviewDialog(QDialog):
             f"[{resource.resource_type.value} / {resource.provider.value} / {resource.region}]"
         ))
 
-        editor = QPlainTextEdit()
-        editor.setReadOnly(True)
-        editor.setPlainText(json.dumps(resource.metadata, indent=2, default=str))
-        editor.setFont(QFont("Consolas", 9))
-        layout.addWidget(editor)
+        self.editor = QPlainTextEdit()
+        self.editor.setReadOnly(True)
+        self.editor.setPlainText(json.dumps(resource.metadata, indent=2, default=str))
+        self.editor.setFont(QFont("Consolas", 9))
+        layout.addWidget(self.editor)
 
         btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        copy_btn = btns.addButton("📋 Copy JSON", QDialogButtonBox.ButtonRole.ActionRole)
+        copy_btn.clicked.connect(self._copy_json)
         btns.rejected.connect(self.reject)
         layout.addWidget(btns)
+
+    def _copy_json(self) -> None:
+        from PyQt6.QtWidgets import QApplication
+        QApplication.clipboard().setText(self.editor.toPlainText())
+        self.setWindowTitle("JSON Copied! ✅")

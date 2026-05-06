@@ -181,7 +181,7 @@ class CloudResource:
 
     @property
     def cost_label(self) -> str:
-        if self.estimated_cost <= 0:
+        if self.estimated_cost < 0:
             return "–"
         return f"${self.estimated_cost:,.2f}/mo"
 
@@ -192,6 +192,14 @@ class CloudResource:
         return ", ".join(f"{k}={v}" for k, v in list(self.tags.items())[:5])
 
     def to_dict(self) -> dict:
+        def _serialize(obj):
+            from datetime import datetime
+            if isinstance(obj, datetime): return obj.isoformat()
+            if isinstance(obj, (set, tuple)): return list(obj)
+            if isinstance(obj, dict): return {k: _serialize(v) for k, v in obj.items()}
+            if isinstance(obj, list): return [_serialize(i) for i in obj]
+            return obj
+
         return {
             "resource_id":    self.resource_id,
             "name":           self.name,
@@ -205,4 +213,23 @@ class CloudResource:
             "dependencies":   self.dependencies,
             "tags":           self.tags,
             "age_days":       self.age_days,
+            "metadata":       _serialize(self.metadata),
         }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CloudResource:
+        return cls(
+            resource_id=data["resource_id"],
+            name=data.get("name", ""),
+            resource_type=ResourceType(data["resource_type"]),
+            provider=ProviderName(data["provider"]),
+            region=data["region"],
+            parent_id=data.get("parent_id"),
+            deletion_layer=data.get("deletion_layer", 1),
+            status=data.get("status", ""),
+            estimated_cost=data.get("estimated_cost", 0.0),
+            dependencies=data.get("dependencies", []),
+            tags=data.get("tags", {}),
+            age_days=data.get("age_days", -1),
+            metadata=data.get("metadata", {}),
+        )

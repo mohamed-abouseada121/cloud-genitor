@@ -29,10 +29,12 @@ from providers.gcp_manager import GCPManager
 from providers.oracle_manager import OracleManager
 from ui.dialogs.confirm_delete import ConfirmDeleteDialog
 from ui.dialogs.credentials_dialog import CredentialsDialog
+from ui.dialogs.schedule_dialog import ScheduleDialog
 from ui.filter_bar import FilterBar
 from ui.log_console import LogConsole, QtLogHandler
 from ui.resource_tree import ResourceTree
 from ui.sidebar import Sidebar
+from ui.multi_region_selector import MultiRegionSelector
 from utils.credentials import (
     AWSCredentials, AzureCredentials, AlibabaCredentials,
     GCPCredentials, OracleCredentials,
@@ -151,16 +153,21 @@ class MainWindow(QMainWindow):
         self._active_provider_name: str         = ""
         self._active_account_name: str          = ""
         self._active_provider: Optional[object] = None
-        self._scan_worker:   Optional[ScanWorker]   = None
-        self._delete_worker: Optional[DeleteWorker] = None
+        self._scan_workers:  list[ScanWorker] = []
+        self._delete_workers: list[DeleteWorker] = []
         self._is_deleting:   bool                   = False
         self._all_resources: list[CloudResource]    = []
 
         self._build_ui()
         self._setup_shortcuts()
         self._setup_logging()
-        self._setup_scheduler()
-        self._apply_theme(self._settings.get("theme", "dark"))
+    def _setup_scheduler(self) -> None:
+        from PyQt6.QtCore import QTimer
+        self._schedule_timer = QTimer(self)
+        self._schedule_timer.timeout.connect(self._check_schedules)
+        self._schedule_timer.start(60000) # Check every minute
+
+    def _apply_theme(self, theme: str) -> None:
         self._restore_geometry()
 
     def _build_ui(self) -> None:
@@ -244,10 +251,8 @@ class MainWindow(QMainWindow):
         bar.addSeparator()
 
         bar.addWidget(QLabel(" Region: "))
-        self._region_combo = QComboBox()
-        self._region_combo.setMinimumWidth(180)
-        self._region_combo.addItem("All Regions")
-        bar.addWidget(self._region_combo)
+        self._region_selector = MultiRegionSelector()
+        bar.addWidget(self._region_selector)
         bar.addSeparator()
 
         self._dry_run_cb = QCheckBox("Dry Run")
@@ -262,6 +267,10 @@ class MainWindow(QMainWindow):
         self._scan_btn = QPushButton("🔍  Scan")
         self._scan_btn.clicked.connect(self._on_scan)
         bar.addWidget(self._scan_btn)
+
+        self._scan_all_btn = QPushButton("🚀  Scan All")
+        self._scan_all_btn.clicked.connect(self._on_scan_all)
+        bar.addWidget(self._scan_all_btn)
 
         self._delete_btn = QPushButton("🗑  Delete Selected")
         self._delete_btn.setEnabled(False)
@@ -282,6 +291,10 @@ class MainWindow(QMainWindow):
         self._creds_btn = QPushButton("⚙  Credentials")
         self._creds_btn.clicked.connect(self._on_credentials)
         bar.addWidget(self._creds_btn)
+
+        self._schedule_btn = QPushButton("📅  Schedule")
+        self._schedule_btn.clicked.connect(self._on_schedule)
+        bar.addWidget(self._schedule_btn)
 
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
@@ -376,10 +389,8 @@ class MainWindow(QMainWindow):
         provider_name = self._active_provider_name
         static_list = _STATIC_REGIONS.get(provider_name, ["Default"])
         
-        # Show static regions immediately (usable without waiting)
-        self._region_combo.clear()
-        self._region_combo.addItem("All Regions")
-        self._region_combo.addItems(static_list)
+        # Show static regions immediately
+        self._region_selector.set_regions(static_list)
         
         # If we have no credentials, keep static list and stop
         creds = self._build_credentials(provider_name, self._active_account_name)
@@ -405,69 +416,90 @@ class MainWindow(QMainWindow):
         self._rw.start()
 
     def _on_regions_loaded(self, regions: list) -> None:
-        current = self._region_combo.currentText()
-        
-        self._region_combo.clear()
-        self._region_combo.addItem("All Regions")
-        
         if regions:
             combined = sorted(list(set(regions + _STATIC_REGIONS.get(self._active_provider_name, []))))
-            self._region_combo.addItems(combined)
+            self._region_selector.set_regions(combined)
         else:
-            self._region_combo.addItems(_STATIC_REGIONS.get(self._active_provider_name, []))
-        
-        # Restore previous selection if it still exists
-        idx = self._region_combo.findText(current)
-        if idx >= 0:
-            self._region_combo.setCurrentIndex(idx)
+            self._region_selector.set_regions(_STATIC_REGIONS.get(self._active_provider_name, []))
 
     def _on_scan(self) -> None:
         if not self._active_provider: return
-        if self._scan_worker and self._scan_worker.isRunning():
-            self._scan_worker.cancel()
+        if self._scan_workers:
+            for w in self._scan_workers:
+                w.cancel()
+            self._scan_workers.clear()
             return
         
         self._all_resources.clear()
         self._resource_tree.clear()
-        region = self._region_combo.currentText()
-        # Build region list — filter out any non-region placeholder items
-        _non_regions = {"all regions", "default"}
-        if region.lower() in _non_regions:
-            regions = [
-                self._region_combo.itemText(i)
-                for i in range(1, self._region_combo.count())
-                if self._region_combo.itemText(i).lower() not in _non_regions
-            ]
-        else:
-            regions = [region]
+        regions = self._region_selector.get_selected()
+        if not regions:
+            self._log_console.log_message.emit("⚠ Please select at least one region.")
+            return
 
+        self._start_scan_for_provider(self._active_provider_name, regions)
+
+    def _on_scan_all(self) -> None:
+        if self._scan_workers:
+            for w in self._scan_workers:
+                w.cancel()
+            self._scan_workers.clear()
+            return
+
+        self._all_resources.clear()
+        self._resource_tree.clear()
+        
+        active_providers = []
+        for p_name in _PROVIDER_CLASSES.keys():
+            creds = self._build_credentials(p_name, self._active_account_name or "Default")
+            if creds:
+                active_providers.append(p_name)
+        
+        if not active_providers:
+            self._log_console.log_message.emit("⚠ No valid credentials found for any provider.")
+            return
+
+        self._log_console.log_message.emit(f"🚀 Starting parallel scan for: {', '.join(active_providers)}")
+        for p_name in active_providers:
+            regions = _STATIC_REGIONS.get(p_name, ["Default"])
+            self._start_scan_for_provider(p_name, regions)
+
+    def _start_scan_for_provider(self, provider_name: str, regions: list[str]) -> None:
         def _factory():
-            p = _PROVIDER_CLASSES[self._active_provider_name](log_callback=lambda m: self._log_console.log_message.emit(m))
-            creds = self._build_credentials(self._active_provider_name, self._active_account_name)
+            p = _PROVIDER_CLASSES[provider_name](log_callback=lambda m: self._log_console.log_message.emit(m))
+            creds = self._build_credentials(provider_name, self._active_account_name or "Default")
             if not creds:
-                raise ValueError(f"No credentials found for {self._active_account_name}")
-            if not p.connect(creds):
-                raise ConnectionError(f"Failed to connect to {self._active_provider_name}")
+                raise ValueError(f"No credentials found for {provider_name}")
+            if not p.connect(creds, test_connection=False):
+                raise ConnectionError(f"Failed to connect to {provider_name}")
             return p
 
-        self._scan_worker = ScanWorker(_factory, self._active_provider_name, regions, "hierarchical")
-        self._scan_worker.log_message.connect(self._log_console.log_message)
-        self._scan_worker.resource_found.connect(self._on_resource_found)
-        self._scan_worker.finished.connect(self._on_scan_finished)
-        self._scan_worker.progress.connect(self._progress.setValue)
+        worker = ScanWorker(_factory, provider_name, regions, "hierarchical", state_manager=self._state_manager)
+        worker.log_message.connect(self._log_console.log_message)
+        worker.resource_found.connect(self._on_resource_found)
+        worker.finished.connect(lambda res, w=worker: self._on_worker_finished(w))
+        worker.progress.connect(self._progress.setValue)
         
+        self._scan_workers.append(worker)
         self._progress.setVisible(True)
         self._scan_btn.setText("🛑 Stop Scan")
-        self._scan_worker.start()
+        self._scan_all_btn.setText("🛑 Stop All")
+        worker.start()
 
     def _on_resource_found(self, r: CloudResource) -> None:
         self._all_resources.append(r)
 
-    def _on_scan_finished(self, resources: list) -> None:
-        self._resource_tree.populate_tree(resources)
-        self._progress.setVisible(False)
-        self._scan_btn.setText("🔍 Scan")
-        self._update_ui_state()
+    def _on_worker_finished(self, worker: ScanWorker) -> None:
+        if worker in self._scan_workers:
+            self._scan_workers.remove(worker)
+        
+        if not self._scan_workers:
+            self._progress.setVisible(False)
+            self._scan_btn.setText("🔍  Scan")
+            self._scan_all_btn.setText("🚀  Scan All")
+            self._status_label.setText(f"Scan complete — {len(self._all_resources)} resources found.")
+            self._resource_tree.populate_tree(self._all_resources)
+            self._update_ui_state()
 
     def _on_tree_selection_changed(self, count: int) -> None:
         self._update_ui_state()
@@ -479,33 +511,61 @@ class MainWindow(QMainWindow):
         if not selected: return
         if not ConfirmDeleteDialog(selected, self._dry_run_cb.isChecked(), self).exec(): return
 
+        # Group by provider
+        by_provider: dict[str, list[CloudResource]] = {}
+        for r in selected:
+            p_name = r.provider.value
+            if p_name not in by_provider: by_provider[p_name] = []
+            by_provider[p_name].append(r)
+
         self._is_deleting = True
         self._update_ui_state()
-        self._delete_worker = DeleteWorker(self._active_provider, selected, dry_run=self._dry_run_cb.isChecked(), state_manager=self._state_manager)
-        self._delete_worker.log_message.connect(self._log_console.log_message)
-        self._delete_worker.resource_deleted.connect(self._on_resource_deleted)
-        self._delete_worker.finished.connect(self._on_delete_finished)
-        self._delete_worker.progress.connect(self._progress.setValue)
         self._progress.setVisible(True)
-        self._delete_worker.start()
+
+        for p_name, resources in by_provider.items():
+            def _factory(name=p_name):
+                p = _PROVIDER_CLASSES[name](log_callback=lambda m: self._log_console.log_message.emit(m))
+                creds = self._build_credentials(name, self._active_account_name or "Default")
+                if not creds: raise ValueError(f"No credentials for {name}")
+                if not p.connect(creds, test_connection=False): raise ConnectionError(f"Failed to connect to {name}")
+                return p
+
+            worker = DeleteWorker(_factory, resources, dry_run=self._dry_run_cb.isChecked(), state_manager=self._state_manager)
+            worker.log_message.connect(self._log_console.log_message)
+            worker.resource_deleted.connect(self._on_resource_deleted)
+            worker.finished.connect(lambda r, w=worker: self._on_delete_worker_finished(w))
+            worker.progress.connect(self._progress.setValue)
+            
+            self._delete_workers.append(worker)
+            worker.start()
+
+    def _on_delete_worker_finished(self, worker: DeleteWorker) -> None:
+        if worker in self._delete_workers:
+            self._delete_workers.remove(worker)
+        
+        if not self._delete_workers:
+            self._is_deleting = False
+            self._progress.setVisible(False)
+            self._update_ui_state()
 
     def _on_stop(self) -> None:
-        if self._delete_worker: self._delete_worker.cancel()
+        if self._delete_workers:
+            for w in self._delete_workers:
+                w.cancel()
+            self._delete_workers.clear()
+        self._is_deleting = False
+        self._update_ui_state()
 
     def _update_ui_state(self) -> None:
-        scanning = self._scan_worker and self._scan_worker.isRunning()
+        scanning = bool(self._scan_workers)
         self._scan_btn.setEnabled(not self._is_deleting)
+        self._scan_all_btn.setEnabled(not self._is_deleting)
         self._delete_btn.setEnabled(not scanning and not self._is_deleting and len(self._resource_tree.get_checked_resources()) > 0)
         self._stop_btn.setVisible(self._is_deleting)
         self._sidebar.setEnabled(not scanning and not self._is_deleting)
 
     def _on_resource_deleted(self, r, msg) -> None:
         if r.deletion_status: self._resource_tree.update_deletion_status(r.resource_id, r.deletion_status)
-
-    def _on_delete_finished(self, r) -> None:
-        self._is_deleting = False
-        self._progress.setVisible(False)
-        self._update_ui_state()
 
     def _on_filters_changed(self, f) -> None:
         if self._resource_tree: self._resource_tree.apply_filters(f)
@@ -520,6 +580,53 @@ class MainWindow(QMainWindow):
     def _on_credentials(self) -> None:
         if CredentialsDialog(self._settings, self).exec():
             if self._active_provider_name: self._connect_provider(self._active_provider_name, "default"); self._refresh_regions()
+
+    def _on_schedule(self) -> None:
+        if not self._active_provider:
+            self._log_console.log_message.emit("⚠ Please select a provider first.")
+            return
+        regions = self._region_selector.get_selected()
+        if not regions:
+            self._log_console.log_message.emit("⚠ Please select regions to schedule.")
+            return
+            
+        dlg = ScheduleDialog(self._active_provider_name, regions, self)
+        if dlg.exec():
+            data = dlg.get_data()
+            self._state_manager.add_schedule(
+                self._active_provider_name, regions, "hierarchical", data["interval"]
+            )
+            self._log_console.log_message.emit(f"📅 Scheduled scan every {data['interval']}h for {len(regions)} region(s).")
+
+    def _check_schedules(self) -> None:
+        if self._scan_worker and self._scan_worker.isRunning():
+            return
+            
+        schedules = self._state_manager.get_active_schedules()
+        now = datetime.utcnow()
+        
+        for s in schedules:
+            next_run = datetime.fromisoformat(s["next_run"])
+            if now >= next_run:
+                import json
+                self._log_console.log_message.emit(f"🕒 [Auto] Starting scheduled scan for {s['provider']}...")
+                self._state_manager.update_schedule_run(s["id"])
+                
+                # Trigger scan logic (simplified for background)
+                regions = json.loads(s["regions"])
+                def _factory():
+                    p = _PROVIDER_CLASSES[s["provider"]](log_callback=lambda m: self._log_console.log_message.emit(m))
+                    creds = self._build_credentials(s["provider"], "default")
+                    if not p.connect(creds):
+                         raise ConnectionError(f"Failed to connect to {s['provider']}")
+                    return p
+
+                self._scan_worker = ScanWorker(_factory, s["provider"], regions, s["mode"], state_manager=self._state_manager)
+                self._scan_worker.log_message.connect(self._log_console.log_message)
+                self._scan_worker.resource_found.connect(self._on_resource_found)
+                self._scan_worker.finished.connect(self._on_scan_finished)
+                self._scan_worker.start()
+                break # Only run one at a time
 
     def _toggle_theme(self) -> None:
         new_theme = "light" if self._settings.get("theme") == "dark" else "dark"

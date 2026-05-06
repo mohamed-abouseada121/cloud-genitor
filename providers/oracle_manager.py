@@ -21,8 +21,14 @@ from typing import Any, Optional
 
 from models.resource import CloudResource, ProviderName, ResourceType
 from providers.base_provider import CloudProvider
-from utils.credentials import OracleCredentials
+from utils.credentials import OracleCredentials, CredentialManager
 from utils.pagination import oci_paginate
+
+# SDK Imports (Global for speed)
+try:
+    import oci
+except ImportError:
+    pass
 
 log = logging.getLogger(__name__)
 
@@ -64,11 +70,8 @@ class OracleManager(CloudProvider):
 
     # ── connection ────────────────────────────────────────────────────────────
 
-    def connect(self, credentials: OracleCredentials) -> bool:
+    def connect(self, credentials: OracleCredentials, test_connection: bool = True) -> bool:
         try:
-            import oci  # type: ignore
-            from utils.credentials import CredentialManager
-
             self._config = CredentialManager().get_oci_config(credentials)
             self._tenancy_id = self._config["tenancy"]
 
@@ -253,12 +256,13 @@ class OracleManager(CloudProvider):
 
     def _make_resource(self, rid, name, rtype, parent_id=None,
                        status="", metadata=None, layer=1,
-                       estimated_cost=0.0) -> CloudResource:
+                       estimated_cost=0.0, age_days=0) -> CloudResource:
         return CloudResource(
             resource_id=rid, name=name, resource_type=rtype,
             provider=ProviderName.ORACLE, region=self._config.get("region", "") if self._config else "",
             parent_id=parent_id, deletion_layer=layer,
             status=status, estimated_cost=estimated_cost,
+            age_days=age_days,
             metadata=metadata or {},
         )
 
@@ -318,6 +322,8 @@ class OracleManager(CloudProvider):
                     ResourceType.INSTANCE, parent_id=compartment_id,
                     status=inst.lifecycle_state, layer=1,
                     metadata={"shape": inst.shape},
+                    estimated_cost=36.0 if inst.lifecycle_state == "RUNNING" else 0.0,
+                    age_days=self._get_age(inst),
                 ))
         return resources
 
@@ -333,6 +339,7 @@ class OracleManager(CloudProvider):
                     ResourceType.BLOCK_VOLUME, parent_id=compartment_id,
                     status=vol.lifecycle_state, layer=2,
                     estimated_cost=cost if vol.lifecycle_state == "AVAILABLE" else 0.0,
+                    age_days=self._get_age(vol),
                 ))
         return resources
 
@@ -416,6 +423,8 @@ class OracleManager(CloudProvider):
                     resources.append(self._make_resource(
                         cluster.id, cluster.name, ResourceType.KUBERNETES,
                         parent_id=cluster.vcn_id, status=cluster.lifecycle_state, layer=2,
+                        estimated_cost=0.0, # Control plane is free
+                        age_days=self._get_age(cluster),
                     ))
                     
                     # Scan Node Pools
@@ -477,7 +486,8 @@ class OracleManager(CloudProvider):
                     status="available",
                     metadata={"namespace": namespace, "compartment_id": compartment_id},
                     layer=2,
-                    estimated_cost=0.0,  # OCI Object Storage: ~$0.0255/GB/month
+                    estimated_cost=1.0,  # Average base storage cost
+                    age_days=self._get_age(bucket),
                 ))
         except Exception as exc:
             self._emit(f"[Oracle] Error scanning OCI Buckets: {exc}")

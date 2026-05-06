@@ -66,6 +66,7 @@ class DeleteWorker(BaseWorker):
             succeeded = 0
             failed    = 0
 
+            affected_regions: set[str] = set()
             for idx, resource in enumerate(ordered):
                 if self._check_cancelled():
                     self._log("[Delete] Cancelled by user.")
@@ -106,6 +107,7 @@ class DeleteWorker(BaseWorker):
 
                         if self._state_manager and not self._dry_run:
                             self._state_manager.mark_success(resource.resource_id)
+                            affected_regions.add(resource.region)
 
                         self.resource_deleted.emit(resource, result)
                         succeeded += 1
@@ -134,6 +136,13 @@ class DeleteWorker(BaseWorker):
 
                 pct = int((idx + 1) / total * 100)
                 self.progress.emit(pct)
+
+            # Invalidate cache for affected regions to ensure next scan is fresh
+            if self._state_manager and not self._dry_run and affected_regions:
+                p_name = self._provider.provider_name
+                for reg in affected_regions:
+                    self._state_manager.clear_scan_cache(p_name, reg)
+                self._log(f"[Delete] Invalidated scan cache for {len(affected_regions)} region(s).")
 
             summary = (
                 f"[Delete] Complete — {succeeded} succeeded, {failed} failed"
